@@ -15,7 +15,7 @@ namespace DTcms.Core.Common.Helpers
     /// </summary>
     public static class AIExamHelper
     {
-        private const int MaxGradesPerRoom = int.MaxValue;
+        private const int MaxGradesPerRoom = 2;
 
         /// <summary>
         /// 自动排考
@@ -403,9 +403,10 @@ namespace DTcms.Core.Common.Helpers
                 }
 
                 var ordered = rooms
-                    .Where(r => !usedRooms.Contains(r.RoomId)
+                    .Where(r => r.AvailableSeats > 0
+                        && !usedRooms.Contains(r.RoomId)
                         && (avoidRooms == null || !avoidRooms.Contains(r.RoomId)))
-                    .OrderByDescending(r => r.SeatCount)
+                    .OrderByDescending(r => r.AvailableSeats)
                     .ThenBy(r => r.RoomId)
                     .ToList();
 
@@ -420,13 +421,13 @@ namespace DTcms.Core.Common.Helpers
                     return;
                 }
 
-                var distribution = DistributeStudents(needed, ordered.Select(r => r.SeatCount).ToList());
+                var distribution = DistributeStudents(needed, ordered.Select(r => r.AvailableSeats).ToList());
                 if (distribution == null)
                 {
                     return;
                 }
 
-                var waste = ordered.Sum(r => r.SeatCount) - needed;
+                var waste = ordered.Sum(r => r.AvailableSeats) - needed;
                 var adjacency = CalculateAdjacencyScore(ordered);
                 candidates.Add((ordered, distribution, waste, adjacency));
             }
@@ -448,7 +449,8 @@ namespace DTcms.Core.Common.Helpers
 
             var globalAvailable = buildings
                 .SelectMany(b => b.Rooms)
-                .Where(r => !usedRooms.Contains(r.RoomId)
+                .Where(r => r.AvailableSeats > 0
+                    && !usedRooms.Contains(r.RoomId)
                     && (avoidRooms == null || !avoidRooms.Contains(r.RoomId)))
                 .ToList();
 
@@ -473,7 +475,10 @@ namespace DTcms.Core.Common.Helpers
             {
                 var room = best.Rooms[i];
                 var assigned = best.Distribution[i];
-                allocation.Add(new ClassRoomSlice(room.RoomId, assigned, room.SeatCount));
+                var capacity = _roomLookup.TryGetValue(room.RoomId, out var info)
+                    ? info.SeatCount
+                    : room.Capacity;
+                allocation.Add(new ClassRoomSlice(room.RoomId, assigned, capacity));
                 usedRooms.Add(room.RoomId);
                 selectedRoomIds.Add(room.RoomId);
             }
@@ -494,14 +499,14 @@ namespace DTcms.Core.Common.Helpers
             }
 
             var ordered = rooms
-                .OrderBy(r => r.SeatCount)
+                .OrderBy(r => r.AvailableSeats)
                 .ThenBy(r => r.RoomId)
                 .ToList();
 
             if (ordered.Count > 18)
             {
                 var greedy = ordered
-                    .OrderByDescending(r => r.SeatCount)
+                    .OrderByDescending(r => r.AvailableSeats)
                     .ThenBy(r => r.RoomId)
                     .ToList();
 
@@ -510,7 +515,7 @@ namespace DTcms.Core.Common.Helpers
                 foreach (var room in greedy)
                 {
                     selection.Add(room);
-                    sum += room.SeatCount;
+                    sum += room.AvailableSeats;
                     if (sum >= needed)
                     {
                         return selection;
@@ -523,7 +528,7 @@ namespace DTcms.Core.Common.Helpers
             var suffix = new int[ordered.Count + 1];
             for (var i = ordered.Count - 1; i >= 0; i--)
             {
-                suffix[i] = suffix[i + 1] + ordered[i].SeatCount;
+                suffix[i] = suffix[i + 1] + ordered[i].AvailableSeats;
             }
 
             List<RoomSnapshot>? best = null;
@@ -563,7 +568,7 @@ namespace DTcms.Core.Common.Helpers
                 for (var i = index; i < ordered.Count; i++)
                 {
                     current.Add(ordered[i]);
-                    Search(i + 1, sum + ordered[i].SeatCount);
+                    Search(i + 1, sum + ordered[i].AvailableSeats);
                     current.RemoveAt(current.Count - 1);
                 }
             }
@@ -649,8 +654,28 @@ namespace DTcms.Core.Common.Helpers
             return remaining == 0 ? distribution.ToList() : null;
         }
 
-        private static bool RoomSupportsGrade(int roomId, int grade, Dictionary<int, HashSet<int>> usage, int maxGradesPerRoom = MaxGradesPerRoom)
+        private static bool RoomSupportsGrade(
+            int roomId,
+            int grade,
+            Dictionary<int, HashSet<int>> usage,
+            Dictionary<int, int>? seatUsage = null,
+            Dictionary<int, AIExamModelRoom>? roomLookup = null,
+            int maxGradesPerRoom = MaxGradesPerRoom)
         {
+            var hasCapacity = true;
+            if (roomLookup != null && roomLookup.TryGetValue(roomId, out var room))
+            {
+                var used = seatUsage != null && seatUsage.TryGetValue(roomId, out var seatCount)
+                    ? seatCount
+                    : 0;
+                hasCapacity = room.SeatCount - used > 0;
+            }
+
+            if (!hasCapacity)
+            {
+                return false;
+            }
+
             if (!usage.TryGetValue(roomId, out var grades) || grades.Count == 0)
             {
                 return true;
@@ -658,10 +683,15 @@ namespace DTcms.Core.Common.Helpers
 
             if (grades.Contains(grade))
             {
-                return true;
+                return hasCapacity;
             }
 
-            return grades.Count < maxGradesPerRoom;
+            if (grades.Count >= maxGradesPerRoom)
+            {
+                return false;
+            }
+
+            return hasCapacity;
         }
 
         #endregion
@@ -1354,6 +1384,7 @@ namespace DTcms.Core.Common.Helpers
 
             var requiredRooms = new List<RoomRequirement>();
             var roomClassMap = new Dictionary<int, HashSet<int>>();
+            var roomAssignments = new Dictionary<int, List<(int ClassId, int Grade, int StudentCount, int SeatCapacity)>>();
             foreach (var subjectItem in group.Subjects)
             {
                 foreach (var cls in subjectItem.Classes)
@@ -1407,6 +1438,14 @@ namespace DTcms.Core.Common.Helpers
                         }
                         classSet.Add(cls.ModelClassId);
 
+                        if (!roomAssignments.TryGetValue(slice.RoomId, out var allocations))
+                        {
+                            allocations = new List<(int ClassId, int Grade, int StudentCount, int SeatCapacity)>();
+                            roomAssignments[slice.RoomId] = allocations;
+                        }
+
+                        allocations.Add((cls.ModelClassId, cls.NJ, slice.StudentCount, room.SeatCount));
+
                         requiredRooms.Add(new RoomRequirement(room.ModelRoomId, subjectItem.Subject.Duration));
                     }
                 }
@@ -1414,7 +1453,7 @@ namespace DTcms.Core.Common.Helpers
 
             foreach (var kvp in roomClassMap)
             {
-                if (kvp.Value.Count <= 1)
+                if (!roomAssignments.TryGetValue(kvp.Key, out var allocations) || allocations.Count == 0)
                 {
                     continue;
                 }
@@ -1423,9 +1462,32 @@ namespace DTcms.Core.Common.Helpers
                     ? conflictRoom.ModelRoomName ?? kvp.Key.ToString()
                     : kvp.Key.ToString();
 
-                failure = $"考场[{roomName}]在同一时间被多个班级使用，无法安排考试。";
-                CaptureRoomConflict(kvp.Key, group, roomClassMap, out conflictingClasses, out conflictingAssignments);
-                return false;
+                if (allocations.Count > 2)
+                {
+                    failure = $"考场[{roomName}]在同一时间安排了超过两个班级，无法满足规则。";
+                    CaptureRoomConflict(kvp.Key, group, roomClassMap, out conflictingClasses, out conflictingAssignments);
+                    return false;
+                }
+
+                if (allocations.Count > 1)
+                {
+                    var distinctGrades = allocations.Select(a => a.Grade).Distinct().Count();
+                    if (distinctGrades < allocations.Count)
+                    {
+                        failure = $"考场[{roomName}]安排了相同年级的多个班级，违反考场分配规则。";
+                        CaptureRoomConflict(kvp.Key, group, roomClassMap, out conflictingClasses, out conflictingAssignments);
+                        return false;
+                    }
+                }
+
+                var capacity = allocations[0].SeatCapacity;
+                var totalStudents = allocations.Sum(a => a.StudentCount);
+                if (totalStudents > capacity)
+                {
+                    failure = $"考场[{roomName}]座位不足，无法同时容纳分配的班级。";
+                    CaptureRoomConflict(kvp.Key, group, roomClassMap, out conflictingClasses, out conflictingAssignments);
+                    return false;
+                }
             }
 
             var forcedSet = group.Subjects
@@ -2257,8 +2319,10 @@ namespace DTcms.Core.Common.Helpers
             private readonly List<AIExamModelClass> _classes;
             private readonly List<AIExamModelRoom> _rooms;
             private readonly Dictionary<int, AIExamModelClass> _classLookup;
+            private readonly Dictionary<int, AIExamModelRoom> _roomLookup;
             private readonly Dictionary<int, List<ClassRoomSlice>> _plans = new Dictionary<int, List<ClassRoomSlice>>();
             private readonly Dictionary<int, HashSet<int>> _roomGradeUsage = new Dictionary<int, HashSet<int>>();
+            private readonly Dictionary<int, int> _roomSeatUsage = new Dictionary<int, int>();
             private readonly Dictionary<int, Dictionary<int, List<ClassRoomSlice>>> _subjectOverrides
                 = new Dictionary<int, Dictionary<int, List<ClassRoomSlice>>>();
             private readonly Dictionary<int, Dictionary<int, HashSet<int>>> _subjectRoomBans
@@ -2269,6 +2333,7 @@ namespace DTcms.Core.Common.Helpers
                 _classes = classes ?? new List<AIExamModelClass>();
                 _rooms = rooms ?? new List<AIExamModelRoom>();
                 _classLookup = _classes.ToDictionary(c => c.ModelClassId);
+                _roomLookup = _rooms.ToDictionary(r => r.ModelRoomId);
             }
 
             public Dictionary<int, List<ClassRoomSlice>> Plans => _plans;
@@ -2296,6 +2361,7 @@ namespace DTcms.Core.Common.Helpers
             {
                 _plans.Clear();
                 _roomGradeUsage.Clear();
+                _roomSeatUsage.Clear();
                 _subjectOverrides.Clear();
                 _subjectRoomBans.Clear();
 
@@ -2375,6 +2441,7 @@ namespace DTcms.Core.Common.Helpers
                 var backupUsage = CloneUsage();
                 var backupOverrides = CloneOverrides();
                 var backupBans = CloneSubjectBans();
+                var backupSeatUsage = CloneSeatUsage();
 
                 var anyChange = false;
                 string? lastFailure = null;
@@ -2428,6 +2495,7 @@ namespace DTcms.Core.Common.Helpers
                 {
                     RestorePlans(backupPlans);
                     RestoreUsage(backupUsage);
+                    RestoreSeatUsage(backupSeatUsage);
                     RestoreOverrides(backupOverrides);
                     RestoreSubjectBans(backupBans);
                     failure = lastFailure ?? "冲突班级未能找到新的考场组合。";
@@ -2491,7 +2559,7 @@ namespace DTcms.Core.Common.Helpers
                 }
 
                 var roomSnapshots = _rooms
-                    .Select(r => new RoomSnapshot(r))
+                    .Select(r => new RoomSnapshot(r, GetAvailableSeatCount(r.ModelRoomId)))
                     .ToList();
 
                 if (roomSnapshots.Count == 0)
@@ -2504,11 +2572,16 @@ namespace DTcms.Core.Common.Helpers
                     .GroupBy(r => r.BuildingId)
                     .Select(g => new BuildingRooms(
                         g.Key,
-                        g.Select(x => new RoomSnapshot(x.RoomId, x.BuildingId, x.RoomNo, x.SeatCount))
+                        g.Select(x => new RoomSnapshot(
+                                x.RoomId,
+                                x.BuildingId,
+                                x.RoomNo,
+                                _roomLookup.TryGetValue(x.RoomId, out var info) ? info.SeatCount : x.Capacity,
+                                x.AvailableSeats))
                             .OrderBy(x => x.RoomNo ?? int.MaxValue)
-                            .ThenBy(x => x.SeatCount)
+                            .ThenBy(x => x.AvailableSeats)
                             .ToList(),
-                        g.Sum(x => x.SeatCount)))
+                        g.Sum(x => x.AvailableSeats)))
                     .OrderByDescending(b => b.TotalSeats)
                     .ThenBy(b => b.BuildingId)
                     .ToList();
@@ -2871,9 +2944,32 @@ namespace DTcms.Core.Common.Helpers
             private List<RoomSnapshot> GetAvailableRoomsForGrade(int grade)
             {
                 return _rooms
-                    .Where(r => RoomSupportsGrade(r.ModelRoomId, grade, _roomGradeUsage))
-                    .Select(r => new RoomSnapshot(r))
+                    .Select(r => new
+                    {
+                        Room = r,
+                        Available = GetAvailableSeatCount(r.ModelRoomId)
+                    })
+                    .Where(x => x.Available > 0
+                        && RoomSupportsGrade(
+                            x.Room.ModelRoomId,
+                            grade,
+                            _roomGradeUsage,
+                            _roomSeatUsage,
+                            _roomLookup))
+                    .Select(x => new RoomSnapshot(x.Room, x.Available))
                     .ToList();
+            }
+
+            private int GetAvailableSeatCount(int roomId)
+            {
+                var capacity = _roomLookup.TryGetValue(roomId, out var room)
+                    ? room.SeatCount
+                    : 0;
+                var used = _roomSeatUsage.TryGetValue(roomId, out var occupied)
+                    ? occupied
+                    : 0;
+                var remaining = capacity - used;
+                return remaining > 0 ? remaining : 0;
             }
 
             private bool TryBuildGradePlansForRooms(int grade, List<AIExamModelClass> gradeClasses, List<RoomSnapshot> rooms, out Dictionary<int, List<ClassRoomSlice>> gradePlans, out string? failure)
@@ -2896,11 +2992,16 @@ namespace DTcms.Core.Common.Helpers
                     .GroupBy(r => r.BuildingId)
                     .Select(g => new BuildingRooms(
                         g.Key,
-                        g.Select(x => new RoomSnapshot(x.RoomId, x.BuildingId, x.RoomNo, x.SeatCount))
+                        g.Select(x => new RoomSnapshot(
+                                x.RoomId,
+                                x.BuildingId,
+                                x.RoomNo,
+                                _roomLookup.TryGetValue(x.RoomId, out var info) ? info.SeatCount : x.Capacity,
+                                x.AvailableSeats))
                             .OrderBy(x => x.RoomNo ?? int.MaxValue)
-                            .ThenBy(x => x.SeatCount)
+                            .ThenBy(x => x.AvailableSeats)
                             .ToList(),
-                        g.Sum(x => x.SeatCount)))
+                        g.Sum(x => x.AvailableSeats)))
                     .OrderByDescending(b => b.TotalSeats)
                     .ThenBy(b => b.BuildingId)
                     .ToList();
@@ -2934,6 +3035,22 @@ namespace DTcms.Core.Common.Helpers
                 {
                     foreach (var slice in kvp.Value)
                     {
+                        if (_roomLookup.TryGetValue(slice.RoomId, out var roomInfo))
+                        {
+                            var usedSeats = _roomSeatUsage.TryGetValue(slice.RoomId, out var seats)
+                                ? seats
+                                : 0;
+
+                            if (slice.StudentCount + usedSeats > roomInfo.SeatCount)
+                            {
+                                var classLabel = _classLookup.TryGetValue(kvp.Key, out var classInfo)
+                                    ? classInfo.ModelClassName ?? classInfo.ModelClassId.ToString()
+                                    : kvp.Key.ToString();
+                                failure = $"考场[{roomInfo.ModelRoomName ?? roomInfo.ModelRoomId.ToString()}]剩余座位不足，无法容纳班级[{classLabel}]。";
+                                return false;
+                            }
+                        }
+
                         if (_roomGradeUsage.TryGetValue(slice.RoomId, out var grades)
                             && !grades.Contains(grade)
                             && grades.Count >= MaxGradesPerRoom)
@@ -2956,6 +3073,11 @@ namespace DTcms.Core.Common.Helpers
                         }
 
                         grades.Add(grade);
+
+                        var usedSeats = _roomSeatUsage.TryGetValue(slice.RoomId, out var seats)
+                            ? seats
+                            : 0;
+                        _roomSeatUsage[slice.RoomId] = usedSeats + slice.StudentCount;
                     }
                 }
 
@@ -2989,6 +3111,19 @@ namespace DTcms.Core.Common.Helpers
                                 _roomGradeUsage.Remove(slice.RoomId);
                             }
                         }
+
+                        if (_roomSeatUsage.TryGetValue(slice.RoomId, out var seats))
+                        {
+                            seats -= slice.StudentCount;
+                            if (seats <= 0)
+                            {
+                                _roomSeatUsage.Remove(slice.RoomId);
+                            }
+                            else
+                            {
+                                _roomSeatUsage[slice.RoomId] = seats;
+                            }
+                        }
                     }
 
                     _plans.Remove(classId);
@@ -3010,6 +3145,11 @@ namespace DTcms.Core.Common.Helpers
             private Dictionary<int, HashSet<int>> CloneUsage()
             {
                 return _roomGradeUsage.ToDictionary(kvp => kvp.Key, kvp => new HashSet<int>(kvp.Value));
+            }
+
+            private Dictionary<int, int> CloneSeatUsage()
+            {
+                return _roomSeatUsage.ToDictionary(kvp => kvp.Key, kvp => kvp.Value);
             }
 
             private Dictionary<int, Dictionary<int, List<ClassRoomSlice>>> CloneOverrides()
@@ -3095,6 +3235,15 @@ namespace DTcms.Core.Common.Helpers
                 }
             }
 
+            private void RestoreSeatUsage(Dictionary<int, int> backup)
+            {
+                _roomSeatUsage.Clear();
+                foreach (var kvp in backup)
+                {
+                    _roomSeatUsage[kvp.Key] = kvp.Value;
+                }
+            }
+
             private void RestoreOverrides(Dictionary<int, Dictionary<int, List<ClassRoomSlice>>> backup)
             {
                 _subjectOverrides.Clear();
@@ -3141,6 +3290,11 @@ namespace DTcms.Core.Common.Helpers
                         }
 
                         grades.Add(grade);
+
+                        var usedSeats = _roomSeatUsage.TryGetValue(slice.RoomId, out var seats)
+                            ? seats
+                            : 0;
+                        _roomSeatUsage[slice.RoomId] = usedSeats + slice.StudentCount;
                     }
                 }
             }
@@ -3238,26 +3392,29 @@ namespace DTcms.Core.Common.Helpers
 
         private sealed class RoomSnapshot
         {
-            public RoomSnapshot(AIExamModelRoom room)
+            public RoomSnapshot(AIExamModelRoom room, int? availableSeats = null)
             {
                 RoomId = room.ModelRoomId;
                 BuildingId = room.BuildingId;
                 RoomNo = room.RoomNo;
-                SeatCount = room.SeatCount;
+                Capacity = room.SeatCount;
+                AvailableSeats = availableSeats ?? room.SeatCount;
             }
 
-            public RoomSnapshot(int roomId, int buildingId, int? roomNo, int seatCount)
+            public RoomSnapshot(int roomId, int buildingId, int? roomNo, int capacity, int availableSeats)
             {
                 RoomId = roomId;
                 BuildingId = buildingId;
                 RoomNo = roomNo;
-                SeatCount = seatCount;
+                Capacity = capacity;
+                AvailableSeats = availableSeats;
             }
 
             public int RoomId { get; }
             public int BuildingId { get; }
             public int? RoomNo { get; }
-            public int SeatCount { get; }
+            public int Capacity { get; }
+            public int AvailableSeats { get; }
         }
 
         private sealed class BuildingRooms
