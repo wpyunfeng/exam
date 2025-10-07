@@ -3118,27 +3118,38 @@ namespace DTcms.Core.Common.Helpers
 
                 var currentPlan = new Dictionary<int, List<ClassRoomSlice>>();
                 var usedRooms = new HashSet<int>();
-                var visitedStates = new HashSet<string>();
+                var activeStates = new HashSet<string>();
+                var stateResults = new Dictionary<string, string?>();
                 Dictionary<int, List<ClassRoomSlice>>? bestPlan = null;
 
                 bool Search(int index, out string? localFailure)
                 {
                     localFailure = null;
 
+                    var stateKey = BuildStateKey(index);
+
+                    if (stateResults.TryGetValue(stateKey, out var cachedFailure))
+                    {
+                        localFailure = cachedFailure;
+                        return cachedFailure == null;
+                    }
+
                     if (index >= orderedClasses.Count)
                     {
                         bestPlan = currentPlan.ToDictionary(
                             kvp => kvp.Key,
                             kvp => kvp.Value.Select(slice => slice.Clone()).ToList());
+                        stateResults[stateKey] = null;
+                        activeStates.Remove(stateKey);
                         return true;
                     }
 
-                    var stateKey = BuildStateKey(index);
-                    if (!visitedStates.Add(stateKey))
+                    if (!activeStates.Add(stateKey))
                     {
-                        var repeatedClass = orderedClasses[index];
-                        var repeatedLabel = repeatedClass.ModelClassName ?? repeatedClass.ModelClassId.ToString();
-                        localFailure = $"年级[{grade}]的班级[{repeatedLabel}]无法找到满足规则的考场组合。";
+                        var loopClass = orderedClasses[Math.Min(index, orderedClasses.Count - 1)];
+                        var loopLabel = loopClass.ModelClassName ?? loopClass.ModelClassId.ToString();
+                        localFailure = $"年级[{grade}]的班级[{loopLabel}]无法找到满足规则的考场组合。";
+                        stateResults[stateKey] = localFailure;
                         return false;
                     }
 
@@ -3149,10 +3160,16 @@ namespace DTcms.Core.Common.Helpers
                     {
                         currentPlan[classId] = new List<ClassRoomSlice>();
                         var finished = Search(index + 1, out localFailure);
-                        if (!finished)
+                        if (finished)
+                        {
+                            stateResults[stateKey] = null;
+                        }
+                        else
                         {
                             currentPlan.Remove(classId);
+                            stateResults[stateKey] = localFailure;
                         }
+                        activeStates.Remove(stateKey);
                         return finished;
                     }
 
@@ -3167,6 +3184,8 @@ namespace DTcms.Core.Common.Helpers
                     {
                         var classLabel = cls.ModelClassName ?? classId.ToString();
                         localFailure = $"年级[{grade}]的班级[{classLabel}]无法找到满足规则的考场组合。";
+                        stateResults[stateKey] = localFailure;
+                        activeStates.Remove(stateKey);
                         return false;
                     }
 
@@ -3203,6 +3222,8 @@ namespace DTcms.Core.Common.Helpers
 
                         if (Search(index + 1, out var deeperFailure))
                         {
+                            stateResults[stateKey] = null;
+                            activeStates.Remove(stateKey);
                             return true;
                         }
 
@@ -3222,6 +3243,9 @@ namespace DTcms.Core.Common.Helpers
                         var classLabel = cls.ModelClassName ?? classId.ToString();
                         localFailure = $"年级[{grade}]的班级[{classLabel}]无法找到满足规则的考场组合。";
                     }
+
+                    stateResults[stateKey] = localFailure;
+                    activeStates.Remove(stateKey);
 
                     return false;
                 }
