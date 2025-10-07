@@ -1251,6 +1251,24 @@ namespace DTcms.Core.Common.Helpers
                         return null;
                     }
 
+                    var fallbackSubjectIds = groups
+                        .SelectMany(g => g.Subjects)
+                        .Select(s => s.Subject.ModelSubjectId)
+                        .Distinct()
+                        .Where(id =>
+                            candidateSessionMap.TryGetValue(id, out var options)
+                                && options.Any(opt => opt.Session.SessionKey != session.SessionKey))
+                        .ToList();
+
+                    if (fallbackSubjectIds.Count > 0)
+                    {
+                        retryRequest = new SessionReassignmentRequest(
+                            session,
+                            fallbackSubjectIds,
+                            lastFailure ?? $"场次[{session.TimeNo}]无法完成考场安排。");
+                        return null;
+                    }
+
                     error.AppendLine(lastFailure ?? $"场次[{session.TimeNo}]无法完成考场安排。");
                     return null;
                 }
