@@ -143,6 +143,7 @@ namespace DTcms.Core.Common.Helpers
         private static Dictionary<int, ClassInfo> BuildClasses(List<AIExamModelClass> classes, StringBuilder error)
         {
             var result = new Dictionary<int, ClassInfo>();
+            var order = 0;
             foreach (var item in classes)
             {
                 if (result.ContainsKey(item.ModelClassId))
@@ -161,7 +162,8 @@ namespace DTcms.Core.Common.Helpers
                 {
                     Class = item,
                     Grade = item.Grade,
-                    StudentCount = item.StudentCount
+                    StudentCount = item.StudentCount,
+                    Order = order++
                 };
             }
 
@@ -254,6 +256,10 @@ namespace DTcms.Core.Common.Helpers
                     continue;
                 }
 
+                var orderedClassList = classList
+                    .OrderBy(c => c.Order)
+                    .ToList();
+
                 result.Add(new SubjectInfo
                 {
                     Subject = subject,
@@ -261,7 +267,7 @@ namespace DTcms.Core.Common.Helpers
                     ExamMode = subject.ExamMode ?? string.Empty,
                     Duration = Math.Max(subject.Duration, 0),
                     Priority = subject.Priority,
-                    Classes = classList
+                    Classes = orderedClassList
                 });
             }
 
@@ -560,6 +566,7 @@ namespace DTcms.Core.Common.Helpers
             var container = new RoomAssignmentContainer();
             var eventsLookup = new Dictionary<(int timeIndex, int roomId), RoomEvent>();
             container.EventLookup = eventsLookup;
+            var classPreferences = new Dictionary<int, ClassRoomPreference>();
 
             var orderedSubjects = subjects
                 .Where(s => subjectTimeAssignments.ContainsKey(s.SubjectId))
@@ -585,20 +592,31 @@ namespace DTcms.Core.Common.Helpers
                 }
 
                 var orderedClasses = subject.Classes
-                    .OrderByDescending(c => c.Grade)
+                    .OrderBy(c => c.Order)
+                    .ThenBy(c => c.Grade)
                     .ThenByDescending(c => c.StudentCount)
                     .ToList();
 
                 foreach (var cls in orderedClasses)
                 {
-                    var allocations = FindBestRoomAllocation(cls, subject, slot, candidateRooms, eventsLookup);
-                    if (allocations == null || allocations.Count == 0)
+                    var plan = FindBestRoomAllocation(cls, subject, slot, candidateRooms, eventsLookup, classPreferences);
+                    if (plan == null || plan.Allocations.Count == 0)
                     {
                         error.AppendLine($"无法为科目 {subject.Subject.ModelSubjectName ?? subject.SubjectId.ToString()} 的班级 {cls.Class.ModelClassName ?? cls.Class.ModelClassId.ToString()} 分配考场。");
                         return null;
                     }
 
-                    foreach (var allocation in allocations)
+                    classPreferences[cls.Class.ModelClassId] = new ClassRoomPreference
+                    {
+                        BuildingId = plan.BuildingId,
+                        RoomIds = plan.Allocations
+                            .OrderBy(a => a.Room.RoomNo.HasValue ? 0 : 1)
+                            .ThenBy(a => a.Room.RoomNo ?? a.Room.RoomId)
+                            .Select(a => a.Room.RoomId)
+                            .ToList()
+                    };
+
+                    foreach (var allocation in plan.Allocations)
                     {
                         var key = (slot.Index, allocation.Room.RoomId);
                         if (!eventsLookup.TryGetValue(key, out var roomEvent))
@@ -705,47 +723,50 @@ namespace DTcms.Core.Common.Helpers
             return roomList;
         }
 
-        private static List<RoomAllocation>? FindBestRoomAllocation(ClassInfo cls,
+        private static RoomAllocationPlan? FindBestRoomAllocation(ClassInfo cls,
             SubjectInfo subject,
             TimeSlotInfo slot,
             List<RoomInfo> candidateRooms,
-            Dictionary<(int timeIndex, int roomId), RoomEvent> eventsLookup)
+            Dictionary<(int timeIndex, int roomId), RoomEvent> eventsLookup,
+            Dictionary<int, ClassRoomPreference> classPreferences)
         {
+            classPreferences.TryGetValue(cls.Class.ModelClassId, out var preference);
+
             var buildingGroups = candidateRooms.GroupBy(r => r.BuildingId).ToList();
+            var orderedGroups = buildingGroups
+                .OrderBy(g => preference != null && g.Key == preference.BuildingId ? 0 : 1)
+                .ThenBy(g => g.Key)
+                .ToList();
             RoomAllocationPlan? bestPlan = null;
 
-            foreach (var buildingGroup in buildingGroups)
+            foreach (var buildingGroup in orderedGroups)
             {
-                var plan = TryAllocateInBuilding(cls, subject, slot, buildingGroup.ToList(), eventsLookup);
+                var plan = TryAllocateInBuilding(cls, subject, slot, buildingGroup.ToList(), eventsLookup, preference);
                 if (plan == null)
                 {
                     continue;
                 }
 
-                if (bestPlan == null)
+                if (bestPlan == null || IsBetterPlan(plan, bestPlan))
                 {
                     bestPlan = plan;
                 }
-                else
+
+                if (preference != null && plan.UsedPreferredRooms)
                 {
-                    if (plan.SeatWaste < bestPlan.SeatWaste
-                        || (plan.SeatWaste == bestPlan.SeatWaste && plan.RoomCount < bestPlan.RoomCount)
-                        || (plan.SeatWaste == bestPlan.SeatWaste && plan.RoomCount == bestPlan.RoomCount && plan.RoomNoSpread < bestPlan.RoomNoSpread)
-                        || (plan.SeatWaste == bestPlan.SeatWaste && plan.RoomCount == bestPlan.RoomCount && plan.RoomNoSpread == bestPlan.RoomNoSpread && plan.MaxRoomCapacity < bestPlan.MaxRoomCapacity))
-                    {
-                        bestPlan = plan;
-                    }
+                    break;
                 }
             }
 
-            return bestPlan?.Allocations;
+            return bestPlan;
         }
 
         private static RoomAllocationPlan? TryAllocateInBuilding(ClassInfo cls,
             SubjectInfo subject,
             TimeSlotInfo slot,
             List<RoomInfo> rooms,
-            Dictionary<(int timeIndex, int roomId), RoomEvent> eventsLookup)
+            Dictionary<(int timeIndex, int roomId), RoomEvent> eventsLookup,
+            ClassRoomPreference? preference)
         {
             var candidates = rooms
                 .Select(room => new RoomCandidate
@@ -754,44 +775,110 @@ namespace DTcms.Core.Common.Helpers
                     ExistingEvent = eventsLookup.TryGetValue((slot.Index, room.RoomId), out var evt) ? evt : null
                 })
                 .Where(c => c.AvailableSeats > 0)
-                .OrderBy(c => c.AvailableSeats)
-                .ThenBy(c => c.Room.RoomNo ?? int.MaxValue)
-                .ThenBy(c => c.Room.SeatCount)
+                .OrderBy(c => c.Room.RoomNo.HasValue ? 0 : 1)
+                .ThenBy(c => c.Room.RoomNo ?? c.Room.RoomId)
+                .ThenBy(c => c.AvailableSeats)
+                .ToList();
+
+            if (candidates.Count == 0)
+            {
+                return null;
+            }
+
+            RoomAllocationPlan? bestPlan = null;
+
+            if (preference != null && preference.RoomIds.Count > 0)
+            {
+                var preferredSubset = candidates
+                    .Where(c => preference.RoomIds.Contains(c.Room.RoomId))
+                    .ToList();
+
+                var preferredPlan = AllocateWithinCandidates(cls, subject, preferredSubset);
+                if (preferredPlan != null)
+                {
+                    preferredPlan.UsedPreferredRooms = true;
+                    preferredPlan.BuildingId = rooms.First().BuildingId;
+                    bestPlan = preferredPlan;
+                }
+            }
+
+            foreach (var subset in EnumerateCandidateSubsets(candidates, cls.StudentCount))
+            {
+                var plan = AllocateWithinCandidates(cls, subject, subset);
+                if (plan == null)
+                {
+                    continue;
+                }
+
+                plan.BuildingId = rooms.First().BuildingId;
+                if (preference != null && subset.All(c => preference.RoomIds.Contains(c.Room.RoomId)))
+                {
+                    plan.UsedPreferredRooms = true;
+                }
+
+                if (bestPlan == null || IsBetterPlan(plan, bestPlan))
+                {
+                    bestPlan = plan;
+                }
+            }
+
+            return bestPlan;
+        }
+
+        private static IEnumerable<List<RoomCandidate>> EnumerateCandidateSubsets(List<RoomCandidate> candidates, int requiredStudents)
+        {
+            for (var start = 0; start < candidates.Count; start++)
+            {
+                var subset = new List<RoomCandidate>();
+                var total = 0;
+
+                for (var end = start; end < candidates.Count; end++)
+                {
+                    var candidate = candidates[end];
+                    subset.Add(candidate);
+                    total += candidate.AvailableSeats;
+
+                    if (total >= requiredStudents)
+                    {
+                        yield return new List<RoomCandidate>(subset);
+                    }
+                }
+            }
+        }
+
+        private static RoomAllocationPlan? AllocateWithinCandidates(ClassInfo cls, SubjectInfo subject, List<RoomCandidate> candidates)
+        {
+            if (candidates.Count == 0)
+            {
+                return null;
+            }
+
+            var ordered = candidates
+                .OrderBy(c => c.Room.RoomNo.HasValue ? 0 : 1)
+                .ThenBy(c => c.Room.RoomNo ?? c.Room.RoomId)
+                .ThenBy(c => c.AvailableSeats)
                 .ToList();
 
             var remaining = cls.StudentCount;
             var allocations = new List<RoomAllocation>();
+            var capacities = ordered.Select(c => c.AvailableSeats).ToList();
 
-            foreach (var candidate in candidates)
+            for (var i = 0; i < ordered.Count && remaining > 0; i++)
             {
-                if (candidate.ExistingEvent != null)
+                var candidate = ordered[i];
+                if (!IsCandidateValid(candidate, cls, subject))
                 {
-                    if (candidate.ExistingEvent.Subject.SubjectId != subject.SubjectId)
-                    {
-                        continue;
-                    }
-
-                    if (candidate.ExistingEvent.ClassShares.Any(s => s.Class.Grade == cls.Grade && s.Class.Class.ModelClassId != cls.Class.ModelClassId))
-                    {
-                        continue;
-                    }
-
-                    if (candidate.ExistingEvent.ClassShares.Count >= 2 && candidate.ExistingEvent.ClassShares.All(s => s.Class.Class.ModelClassId != cls.Class.ModelClassId))
-                    {
-                        continue;
-                    }
+                    return null;
                 }
 
-                var available = candidate.AvailableSeats;
-                if (available <= 0)
-                {
-                    continue;
-                }
+                var roomsLeft = ordered.Count - i;
+                var target = (int)Math.Ceiling((double)remaining / roomsLeft);
+                var available = capacities[i];
+                var assign = Math.Min(available, target);
 
-                var assign = Math.Min(available, remaining);
                 if (assign <= 0)
                 {
-                    continue;
+                    return null;
                 }
 
                 allocations.Add(new RoomAllocation
@@ -802,14 +889,27 @@ namespace DTcms.Core.Common.Helpers
                 });
 
                 remaining -= assign;
-
-                if (remaining <= 0)
-                {
-                    break;
-                }
             }
 
-            if (remaining > 0)
+            while (remaining > 0)
+            {
+                var candidateIndex = allocations
+                    .Select((alloc, idx) => new { alloc, idx, extra = capacities[idx] - alloc.Students })
+                    .Where(x => x.extra > 0)
+                    .OrderBy(x => x.alloc.Students)
+                    .ThenByDescending(x => x.extra)
+                    .FirstOrDefault();
+
+                if (candidateIndex == null)
+                {
+                    return null;
+                }
+
+                candidateIndex.alloc.Students += 1;
+                remaining -= 1;
+            }
+
+            if (!AreAllocationsAdjacent(allocations))
             {
                 return null;
             }
@@ -822,6 +922,9 @@ namespace DTcms.Core.Common.Helpers
 
             var roomNos = allocations.Where(a => a.Room.RoomNo.HasValue).Select(a => a.Room.RoomNo!.Value).ToList();
             var spread = roomNos.Count > 1 ? roomNos.Max() - roomNos.Min() : 0;
+            var balancePenalty = allocations.Count > 1
+                ? allocations.Max(a => a.Students) - allocations.Min(a => a.Students)
+                : 0;
 
             return new RoomAllocationPlan
             {
@@ -829,8 +932,102 @@ namespace DTcms.Core.Common.Helpers
                 SeatWaste = seatWaste,
                 RoomCount = allocations.Count,
                 MaxRoomCapacity = allocations.Max(a => a.Room.SeatCount),
-                RoomNoSpread = spread
+                RoomNoSpread = spread,
+                BalancePenalty = balancePenalty
             };
+        }
+
+        private static bool IsCandidateValid(RoomCandidate candidate, ClassInfo cls, SubjectInfo subject)
+        {
+            if (candidate.ExistingEvent == null)
+            {
+                return candidate.AvailableSeats > 0;
+            }
+
+            if (candidate.ExistingEvent.Subject.SubjectId != subject.SubjectId)
+            {
+                return false;
+            }
+
+            if (candidate.ExistingEvent.ClassShares.Any(s => s.Class.Grade == cls.Grade && s.Class.Class.ModelClassId != cls.Class.ModelClassId))
+            {
+                return false;
+            }
+
+            if (candidate.ExistingEvent.ClassShares.Count >= 2 && candidate.ExistingEvent.ClassShares.All(s => s.Class.Class.ModelClassId != cls.Class.ModelClassId))
+            {
+                return false;
+            }
+
+            return candidate.AvailableSeats > 0;
+        }
+
+        private static bool AreAllocationsAdjacent(List<RoomAllocation> allocations)
+        {
+            if (allocations.Count <= 1)
+            {
+                return true;
+            }
+
+            if (allocations.Any(a => !a.Room.RoomNo.HasValue))
+            {
+                return true;
+            }
+
+            var ordered = allocations
+                .Select(a => a.Room.RoomNo!.Value)
+                .OrderBy(n => n)
+                .ToList();
+
+            for (var i = 1; i < ordered.Count; i++)
+            {
+                if (ordered[i] - ordered[i - 1] > 1)
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        private static bool IsBetterPlan(RoomAllocationPlan candidate, RoomAllocationPlan current)
+        {
+            if (candidate.UsedPreferredRooms && !current.UsedPreferredRooms)
+            {
+                return true;
+            }
+
+            if (!candidate.UsedPreferredRooms && current.UsedPreferredRooms)
+            {
+                return false;
+            }
+
+            if (candidate.SeatWaste != current.SeatWaste)
+            {
+                return candidate.SeatWaste < current.SeatWaste;
+            }
+
+            if (candidate.BalancePenalty != current.BalancePenalty)
+            {
+                return candidate.BalancePenalty < current.BalancePenalty;
+            }
+
+            if (candidate.RoomCount != current.RoomCount)
+            {
+                return candidate.RoomCount < current.RoomCount;
+            }
+
+            if (candidate.RoomNoSpread != current.RoomNoSpread)
+            {
+                return candidate.RoomNoSpread < current.RoomNoSpread;
+            }
+
+            if (candidate.MaxRoomCapacity != current.MaxRoomCapacity)
+            {
+                return candidate.MaxRoomCapacity < current.MaxRoomCapacity;
+            }
+
+            return false;
         }
 
         private static Dictionary<int, HashSet<int>> BuildSubjectRoomRule(List<AIExamRuleRoomSubject>? rules)
@@ -1241,6 +1438,7 @@ namespace DTcms.Core.Common.Helpers
             public AIExamModelClass Class { get; set; } = null!;
             public int Grade { get; set; }
             public int StudentCount { get; set; }
+            public int Order { get; set; }
         }
 
         private sealed class RoomInfo
@@ -1328,6 +1526,15 @@ namespace DTcms.Core.Common.Helpers
             public int RoomCount { get; set; }
             public int MaxRoomCapacity { get; set; }
             public int RoomNoSpread { get; set; }
+            public int BalancePenalty { get; set; }
+            public int BuildingId { get; set; }
+            public bool UsedPreferredRooms { get; set; }
+        }
+
+        private sealed class ClassRoomPreference
+        {
+            public int BuildingId { get; set; }
+            public List<int> RoomIds { get; set; } = new List<int>();
         }
 
         private sealed class RoomAssignmentContainer
