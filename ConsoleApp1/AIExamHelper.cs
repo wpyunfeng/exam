@@ -70,19 +70,19 @@ namespace DTcms.Core.Common.Helpers
             var subjectTimeAssignments = SolveSubjectTimeAllocation(config, subjects, timeSlots, model, error);
             if (subjectTimeAssignments == null)
             {
-                throw new ResponseException(error.ToString(), ErrorCode.SchedulerFail);
+                throw new ResponseException(error.ToString(), ErrorCode.ParamError);
             }
 
             var roomAssignments = AllocateRooms(subjects, rooms, timeSlots, subjectTimeAssignments, model, error);
             if (roomAssignments == null)
             {
-                throw new ResponseException(error.ToString(), ErrorCode.SchedulerFail);
+                throw new ResponseException(error.ToString(), ErrorCode.ParamError);
             }
 
             var teacherAssignments = AssignTeachers(teachers, roomAssignments.RoomEvents, model, error);
             if (teacherAssignments == null)
             {
-                throw new ResponseException(error.ToString(), ErrorCode.SchedulerFail);
+                throw new ResponseException(error.ToString(), ErrorCode.ParamError);
             }
 
             return BuildResults(roomAssignments, teacherAssignments);
@@ -448,9 +448,10 @@ namespace DTcms.Core.Common.Helpers
                     continue;
                 }
 
-                foreach (var (timeIndex, varsInTime) in vars.Where(v => subjectIds.Contains(v.Key.subjectId)).GroupBy(v => v.Key.timeIndex))
+                foreach (var grouping in vars.Where(v => subjectIds.Contains(v.Key.subjectId)).GroupBy(v => v.Key.timeIndex))
                 {
-                    var list = varsInTime.Select(v => v.Value).ToList();
+                    var timeIndex = grouping.Key;
+                    var list = grouping.Select(v => v.Value).ToList();
                     if (list.Count > 1)
                     {
                         cpModel.Add(LinearExpr.Sum(list) <= 1);
