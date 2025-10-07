@@ -475,9 +475,7 @@ namespace DTcms.Core.Common.Helpers
             {
                 var room = best.Rooms[i];
                 var assigned = best.Distribution[i];
-                var capacity = _roomLookup.TryGetValue(room.RoomId, out var info)
-                    ? info.SeatCount
-                    : room.Capacity;
+                var capacity = room.Capacity;
                 allocation.Add(new ClassRoomSlice(room.RoomId, assigned, capacity));
                 usedRooms.Add(room.RoomId);
                 selectedRoomIds.Add(room.RoomId);
