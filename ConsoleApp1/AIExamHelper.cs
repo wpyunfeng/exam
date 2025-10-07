@@ -114,6 +114,7 @@ namespace DTcms.Core.Common.Helpers
             Dictionary<int, SubjectSchedule>? subjectSchedules = null;
             SessionReassignmentRequest? retryRequest = null;
             var maxSessionAttempts = Math.Max(1, sessions.Count * Math.Max(1, subjects.Count) + 5);
+            string? lastPlannerFailure = null;
 
             for (var attempt = 0; attempt < maxSessionAttempts; attempt++)
             {
@@ -167,6 +168,19 @@ namespace DTcms.Core.Common.Helpers
                     error,
                     out retryRequest);
 
+                if (retryRequest != null && string.IsNullOrWhiteSpace(retryRequest.Reason))
+                {
+                    retryRequest = new SessionReassignmentRequest(
+                        retryRequest.Session,
+                        retryRequest.SubjectIds,
+                        $"场次[{retryRequest.Session.TimeNo}]无法完成考场安排。");
+                }
+
+                if (retryRequest != null && !string.IsNullOrWhiteSpace(retryRequest.Reason))
+                {
+                    lastPlannerFailure = retryRequest.Reason;
+                }
+
                 if (subjectSchedules != null)
                 {
                     break;
@@ -195,6 +209,16 @@ namespace DTcms.Core.Common.Helpers
 
                 if (retryRequest == null || retryRequest.SubjectIds.Count == 0)
                 {
+                    if (retryRequest != null && string.IsNullOrWhiteSpace(retryRequest.Reason) && !string.IsNullOrWhiteSpace(lastPlannerFailure))
+                    {
+                        error.AppendLine(lastPlannerFailure);
+                    }
+
+                    if (error.Length == 0 && retryRequest != null)
+                    {
+                        error.AppendLine($"场次[{retryRequest.Session.TimeNo}]无法完成考场安排。");
+                    }
+
                     throw new ResponseException(error.ToString(), ErrorCode.ParamError);
                 }
 
@@ -243,7 +267,11 @@ namespace DTcms.Core.Common.Helpers
             {
                 if (retryRequest != null)
                 {
-                    if (!string.IsNullOrWhiteSpace(retryRequest.Reason))
+                    if (string.IsNullOrWhiteSpace(retryRequest.Reason) && !string.IsNullOrWhiteSpace(lastPlannerFailure))
+                    {
+                        error.AppendLine(lastPlannerFailure);
+                    }
+                    else if (!string.IsNullOrWhiteSpace(retryRequest.Reason))
                     {
                         error.AppendLine(retryRequest.Reason);
                     }
@@ -251,6 +279,10 @@ namespace DTcms.Core.Common.Helpers
                     {
                         error.AppendLine($"场次[{retryRequest.Session.TimeNo}]无法完成考场安排。");
                     }
+                }
+                else if (!string.IsNullOrWhiteSpace(lastPlannerFailure))
+                {
+                    error.AppendLine(lastPlannerFailure);
                 }
 
                 if (error.Length == 0)
@@ -1167,14 +1199,29 @@ namespace DTcms.Core.Common.Helpers
                                             .Select(s => s.Subject.ModelSubjectId)
                                             .Distinct()
                                             .ToList();
-                                        sessionRetry = new SessionReassignmentRequest(session, subjectsNeedingChange, failure);
+                                        var retryReason = string.IsNullOrWhiteSpace(failure)
+                                            ? $"场次[{session.TimeNo}]无法完成考场安排。"
+                                            : failure;
+                                        sessionRetry = new SessionReassignmentRequest(session, subjectsNeedingChange, retryReason);
                                     }
 
-                                    attemptFailure = subjectFailure ?? plannerFailure ?? failure;
+                                    attemptFailure = !string.IsNullOrWhiteSpace(subjectFailure)
+                                        ? subjectFailure
+                                        : !string.IsNullOrWhiteSpace(plannerFailure)
+                                            ? plannerFailure
+                                            : string.IsNullOrWhiteSpace(failure)
+                                                ? $"场次[{session.TimeNo}]无法完成考场安排。"
+                                                : failure;
                                 }
                                 else
                                 {
-                                    attemptFailure = subjectFailure ?? plannerFailure ?? failure;
+                                    attemptFailure = !string.IsNullOrWhiteSpace(subjectFailure)
+                                        ? subjectFailure
+                                        : !string.IsNullOrWhiteSpace(plannerFailure)
+                                            ? plannerFailure
+                                            : string.IsNullOrWhiteSpace(failure)
+                                                ? $"场次[{session.TimeNo}]无法完成考场安排。"
+                                                : failure;
                                 }
                             }
 
@@ -1232,7 +1279,10 @@ namespace DTcms.Core.Common.Helpers
 
                     if (attemptFailure != null)
                     {
-                        lastFailure = attemptFailure;
+                        if (!string.IsNullOrWhiteSpace(attemptFailure))
+                        {
+                            lastFailure = attemptFailure;
+                        }
                         break;
                     }
 
@@ -1265,11 +1315,15 @@ namespace DTcms.Core.Common.Helpers
                         retryRequest = new SessionReassignmentRequest(
                             session,
                             fallbackSubjectIds,
-                            lastFailure ?? $"场次[{session.TimeNo}]无法完成考场安排。");
+                            string.IsNullOrWhiteSpace(lastFailure)
+                                ? $"场次[{session.TimeNo}]无法完成考场安排。"
+                                : lastFailure);
                         return null;
                     }
 
-                    error.AppendLine(lastFailure ?? $"场次[{session.TimeNo}]无法完成考场安排。");
+                    error.AppendLine(string.IsNullOrWhiteSpace(lastFailure)
+                        ? $"场次[{session.TimeNo}]无法完成考场安排。"
+                        : lastFailure);
                     return null;
                 }
             }
