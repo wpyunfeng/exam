@@ -3101,43 +3101,342 @@ namespace DTcms.Core.Common.Helpers
                     return false;
                 }
 
-                var buildings = rooms
-                    .GroupBy(r => r.BuildingId)
-                    .Select(g => new BuildingRooms(
-                        g.Key,
-                        g.Select(x => new RoomSnapshot(
-                                x.RoomId,
-                                x.BuildingId,
-                                x.RoomNo,
-                                _roomLookup.TryGetValue(x.RoomId, out var info) ? info.SeatCount : x.Capacity,
-                                x.AvailableSeats))
-                            .OrderBy(x => x.RoomNo ?? int.MaxValue)
-                            .ThenBy(x => x.AvailableSeats)
-                            .ToList(),
-                        g.Sum(x => x.AvailableSeats)))
-                    .OrderByDescending(b => b.TotalSeats)
-                    .ThenBy(b => b.BuildingId)
+                var availableRooms = rooms
+                    .Where(r => r.AvailableSeats > 0)
+                    .ToDictionary(r => r.RoomId, r => r);
+
+                if (availableRooms.Count == 0)
+                {
+                    failure = $"年级[{grade}]没有可用考场满足分配规则。";
+                    return false;
+                }
+
+                var orderedClasses = gradeClasses
+                    .OrderByDescending(c => c.StudentCount)
+                    .ThenBy(c => c.ModelClassId)
                     .ToList();
 
-                var gradeUsedRooms = new HashSet<int>();
+                var currentPlan = new Dictionary<int, List<ClassRoomSlice>>();
+                var usedRooms = new HashSet<int>();
+                Dictionary<int, List<ClassRoomSlice>>? bestPlan = null;
 
-                foreach (var cls in gradeClasses.OrderByDescending(c => c.StudentCount).ThenBy(c => c.ModelClassId))
+                bool Search(int index, out string? localFailure)
                 {
-                    var allocation = AllocateRoomsForClass(cls, buildings, gradeUsedRooms, null);
-                    if (allocation == null || allocation.Count == 0)
+                    localFailure = null;
+
+                    if (index >= orderedClasses.Count)
                     {
-                        failure = $"年级[{grade}]的班级[{cls.ModelClassName ?? cls.ModelClassId.ToString()}]无法找到满足规则的考场组合。";
+                        bestPlan = currentPlan.ToDictionary(
+                            kvp => kvp.Key,
+                            kvp => kvp.Value.Select(slice => slice.Clone()).ToList());
+                        return true;
+                    }
+
+                    var cls = orderedClasses[index];
+                    var classId = cls.ModelClassId;
+
+                    if (cls.StudentCount <= 0)
+                    {
+                        currentPlan[classId] = new List<ClassRoomSlice>();
+                        var finished = Search(index + 1, out localFailure);
+                        if (!finished)
+                        {
+                            currentPlan.Remove(classId);
+                        }
+                        return finished;
+                    }
+
+                    var options = GenerateClassAllocationOptions(
+                        cls,
+                        availableRooms,
+                        usedRooms,
+                        null,
+                        12);
+
+                    if (options.Count == 0)
+                    {
+                        var classLabel = cls.ModelClassName ?? classId.ToString();
+                        localFailure = $"年级[{grade}]的班级[{classLabel}]无法找到满足规则的考场组合。";
                         return false;
                     }
 
-                    gradePlans[cls.ModelClassId] = allocation;
-                    foreach (var slice in allocation)
+                    foreach (var option in options)
                     {
-                        gradeUsedRooms.Add(slice.RoomId);
+                        var removed = new List<RoomSnapshot>();
+                        var valid = true;
+
+                        foreach (var roomId in option.RoomIds)
+                        {
+                            if (!availableRooms.TryGetValue(roomId, out var snapshot))
+                            {
+                                valid = false;
+                                break;
+                            }
+
+                            removed.Add(snapshot);
+                            availableRooms.Remove(roomId);
+                            usedRooms.Add(roomId);
+                        }
+
+                        if (!valid)
+                        {
+                            foreach (var snapshot in removed)
+                            {
+                                availableRooms[snapshot.RoomId] = snapshot;
+                                usedRooms.Remove(snapshot.RoomId);
+                            }
+
+                            continue;
+                        }
+
+                        currentPlan[classId] = option.Slices.Select(slice => slice.Clone()).ToList();
+
+                        if (Search(index + 1, out var deeperFailure))
+                        {
+                            return true;
+                        }
+
+                        localFailure = deeperFailure;
+                        currentPlan.Remove(classId);
+
+                        for (var i = removed.Count - 1; i >= 0; i--)
+                        {
+                            var snapshot = removed[i];
+                            availableRooms[snapshot.RoomId] = snapshot;
+                            usedRooms.Remove(snapshot.RoomId);
+                        }
+                    }
+
+                    if (localFailure == null)
+                    {
+                        var classLabel = cls.ModelClassName ?? classId.ToString();
+                        localFailure = $"年级[{grade}]的班级[{classLabel}]无法找到满足规则的考场组合。";
+                    }
+
+                    return false;
+                }
+
+                if (Search(0, out failure) && bestPlan != null)
+                {
+                    gradePlans = bestPlan;
+                    return true;
+                }
+
+                gradePlans = new Dictionary<int, List<ClassRoomSlice>>();
+                return false;
+            }
+
+            private List<ClassRoomAllocationOption> GenerateClassAllocationOptions(
+                AIExamModelClass cls,
+                Dictionary<int, RoomSnapshot> availableRooms,
+                HashSet<int> usedRooms,
+                HashSet<int>? avoidRooms,
+                int maxOptions)
+            {
+                var options = new List<ClassRoomAllocationOption>();
+                var seen = new HashSet<string>();
+
+                if (cls == null || cls.StudentCount <= 0)
+                {
+                    options.Add(new ClassRoomAllocationOption(new List<ClassRoomSlice>(), 0, 0));
+                    return options;
+                }
+
+                var eligibleRooms = availableRooms.Values
+                    .Where(r => !usedRooms.Contains(r.RoomId)
+                        && r.AvailableSeats > 0
+                        && (avoidRooms == null || !avoidRooms.Contains(r.RoomId)))
+                    .ToList();
+
+                if (eligibleRooms.Count == 0)
+                {
+                    return options;
+                }
+
+                void AddCandidates(List<RoomSnapshot> source)
+                {
+                    var combos = CollectRoomCombinationCandidates(source, cls.StudentCount, maxOptions * 2);
+                    foreach (var combo in combos)
+                    {
+                        var orderedRooms = combo.Rooms
+                            .OrderByDescending(r => r.AvailableSeats)
+                            .ThenBy(r => r.RoomId)
+                            .ToList();
+
+                        var distribution = DistributeStudents(
+                            cls.StudentCount,
+                            orderedRooms.Select(r => r.AvailableSeats).ToList());
+
+                        if (distribution == null)
+                        {
+                            continue;
+                        }
+
+                        var slices = new List<ClassRoomSlice>();
+                        for (var i = 0; i < orderedRooms.Count; i++)
+                        {
+                            var room = orderedRooms[i];
+                            var assigned = distribution[i];
+                            if (assigned <= 0)
+                            {
+                                slices.Clear();
+                                break;
+                            }
+
+                            var capacity = room.Capacity;
+                            slices.Add(new ClassRoomSlice(room.RoomId, assigned, capacity));
+                        }
+
+                        if (slices.Count == 0)
+                        {
+                            continue;
+                        }
+
+                        var key = string.Join("_", slices
+                            .Select(s => s.RoomId)
+                            .OrderBy(id => id));
+
+                        if (!seen.Add(key))
+                        {
+                            continue;
+                        }
+
+                        options.Add(new ClassRoomAllocationOption(
+                            slices,
+                            combo.Waste,
+                            combo.Adjacency));
                     }
                 }
 
-                return true;
+                foreach (var buildingGroup in eligibleRooms
+                    .GroupBy(r => r.BuildingId)
+                    .Select(g => g.OrderBy(r => r.RoomNo ?? int.MaxValue).ThenBy(r => r.AvailableSeats).ToList()))
+                {
+                    if (buildingGroup.Count == 0)
+                    {
+                        continue;
+                    }
+
+                    AddCandidates(buildingGroup);
+                }
+
+                AddCandidates(eligibleRooms);
+
+                options = options
+                    .OrderBy(o => o.Slices.Count)
+                    .ThenBy(o => o.Waste)
+                    .ThenBy(o => o.Adjacency)
+                    .ThenBy(o => o.RoomIds.Min())
+                    .Take(Math.Max(1, maxOptions))
+                    .ToList();
+
+                return options;
+            }
+
+            private List<RoomCombination> CollectRoomCombinationCandidates(List<RoomSnapshot> rooms, int needed, int maxResults)
+            {
+                var results = new List<RoomCombination>();
+
+                if (rooms == null || rooms.Count == 0 || needed <= 0)
+                {
+                    return results;
+                }
+
+                var ordered = rooms
+                    .OrderBy(r => r.AvailableSeats)
+                    .ThenBy(r => r.RoomId)
+                    .ToList();
+
+                if (ordered.Count > 18)
+                {
+                    var greedy = ordered
+                        .OrderByDescending(r => r.AvailableSeats)
+                        .ThenBy(r => r.RoomId)
+                        .ToList();
+
+                    var selection = new List<RoomSnapshot>();
+                    var sum = 0;
+                    foreach (var room in greedy)
+                    {
+                        selection.Add(room);
+                        sum += room.AvailableSeats;
+                        if (sum >= needed)
+                        {
+                            break;
+                        }
+                    }
+
+                    if (sum >= needed)
+                    {
+                        results.Add(new RoomCombination(
+                            selection,
+                            sum - needed,
+                            CalculateAdjacencyScore(selection)));
+                    }
+
+                    return results;
+                }
+
+                var suffix = new int[ordered.Count + 1];
+                for (var i = ordered.Count - 1; i >= 0; i--)
+                {
+                    suffix[i] = suffix[i + 1] + ordered[i].AvailableSeats;
+                }
+
+                var current = new List<RoomSnapshot>();
+
+                void Search(int index, int sum)
+                {
+                    if (sum >= needed)
+                    {
+                        var combination = current.ToList();
+                        results.Add(new RoomCombination(
+                            combination,
+                            sum - needed,
+                            CalculateAdjacencyScore(combination)));
+
+                        if (results.Count >= maxResults * 5)
+                        {
+                            return;
+                        }
+
+                        return;
+                    }
+
+                    if (index >= ordered.Count)
+                    {
+                        return;
+                    }
+
+                    if (sum + suffix[index] < needed)
+                    {
+                        return;
+                    }
+
+                    for (var i = index; i < ordered.Count; i++)
+                    {
+                        current.Add(ordered[i]);
+                        Search(i + 1, sum + ordered[i].AvailableSeats);
+                        current.RemoveAt(current.Count - 1);
+
+                        if (results.Count >= maxResults * 5)
+                        {
+                            return;
+                        }
+                    }
+                }
+
+                Search(0, 0);
+
+                results = results
+                    .OrderBy(r => r.Rooms.Count)
+                    .ThenBy(r => r.Waste)
+                    .ThenBy(r => r.Adjacency)
+                    .ThenBy(r => r.Rooms.Min(room => room.RoomId))
+                    .Take(Math.Max(1, maxResults))
+                    .ToList();
+
+                return results;
             }
 
             private bool CommitGradePlans(int grade, Dictionary<int, List<ClassRoomSlice>> gradePlans, out string? failure)
@@ -3503,6 +3802,22 @@ namespace DTcms.Core.Common.Helpers
             public ClassRoomSlice Clone() => new ClassRoomSlice(RoomId, StudentCount, SeatCount);
         }
 
+        private sealed class ClassRoomAllocationOption
+        {
+            public ClassRoomAllocationOption(List<ClassRoomSlice> slices, int waste, int adjacency)
+            {
+                Slices = slices ?? new List<ClassRoomSlice>();
+                Waste = waste;
+                Adjacency = adjacency;
+                RoomIds = Slices.Select(slice => slice.RoomId).OrderBy(id => id).ToList();
+            }
+
+            public List<ClassRoomSlice> Slices { get; }
+            public int Waste { get; }
+            public int Adjacency { get; }
+            public List<int> RoomIds { get; }
+        }
+
         private sealed class RoomSnapshot
         {
             public RoomSnapshot(AIExamModelRoom room, int? availableSeats = null)
@@ -3528,6 +3843,20 @@ namespace DTcms.Core.Common.Helpers
             public int? RoomNo { get; }
             public int Capacity { get; }
             public int AvailableSeats { get; }
+        }
+
+        private sealed class RoomCombination
+        {
+            public RoomCombination(List<RoomSnapshot> rooms, int waste, int adjacency)
+            {
+                Rooms = rooms ?? new List<RoomSnapshot>();
+                Waste = waste;
+                Adjacency = adjacency;
+            }
+
+            public List<RoomSnapshot> Rooms { get; }
+            public int Waste { get; }
+            public int Adjacency { get; }
         }
 
         private sealed class BuildingRooms
