@@ -3120,6 +3120,12 @@ namespace DTcms.Core.Common.Helpers
                 var usedRooms = new HashSet<int>();
                 var activeStates = new HashSet<string>();
                 var stateResults = new Dictionary<string, string?>();
+                var remainingStudents = new int[orderedClasses.Count + 1];
+                for (var i = orderedClasses.Count - 1; i >= 0; i--)
+                {
+                    remainingStudents[i] = remainingStudents[i + 1]
+                        + Math.Max(0, orderedClasses[i].StudentCount);
+                }
                 Dictionary<int, List<ClassRoomSlice>>? bestPlan = null;
 
                 bool Search(int index, out string? localFailure)
@@ -3150,6 +3156,22 @@ namespace DTcms.Core.Common.Helpers
                         var loopLabel = loopClass.ModelClassName ?? loopClass.ModelClassId.ToString();
                         localFailure = $"年级[{grade}]的班级[{loopLabel}]无法找到满足规则的考场组合。";
                         stateResults[stateKey] = localFailure;
+                        return false;
+                    }
+
+                    var availableSeatSum = 0;
+                    foreach (var snapshot in availableRooms.Values)
+                    {
+                        availableSeatSum += snapshot.AvailableSeats;
+                    }
+
+                    if (availableSeatSum < remainingStudents[index])
+                    {
+                        var nextClass = orderedClasses[index];
+                        var classLabel = nextClass.ModelClassName ?? nextClass.ModelClassId.ToString();
+                        localFailure = $"年级[{grade}]的班级[{classLabel}]所需座位超过剩余考场容量，无法满足分配规则。";
+                        stateResults[stateKey] = localFailure;
+                        activeStates.Remove(stateKey);
                         return false;
                     }
 
