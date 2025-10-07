@@ -3120,12 +3120,6 @@ namespace DTcms.Core.Common.Helpers
                 var usedRooms = new HashSet<int>();
                 var activeStates = new HashSet<string>();
                 var stateResults = new Dictionary<string, string?>();
-                var remainingStudents = new int[orderedClasses.Count + 1];
-                for (var i = orderedClasses.Count - 1; i >= 0; i--)
-                {
-                    remainingStudents[i] = remainingStudents[i + 1]
-                        + Math.Max(0, orderedClasses[i].StudentCount);
-                }
                 Dictionary<int, List<ClassRoomSlice>>? bestPlan = null;
 
                 bool Search(int index, out string? localFailure)
@@ -3159,13 +3153,29 @@ namespace DTcms.Core.Common.Helpers
                         return false;
                     }
 
+                    var remainingStudentsCount = 0;
+                    for (var i = index; i < orderedClasses.Count; i++)
+                    {
+                        remainingStudentsCount += Math.Max(0, orderedClasses[i].StudentCount);
+                    }
+
                     var availableSeatSum = 0;
                     foreach (var snapshot in availableRooms.Values)
                     {
                         availableSeatSum += snapshot.AvailableSeats;
                     }
 
-                    if (availableSeatSum < remainingStudents[index])
+                    if (remainingStudentsCount == 0)
+                    {
+                        bestPlan = currentPlan.ToDictionary(
+                            kvp => kvp.Key,
+                            kvp => kvp.Value.Select(slice => slice.Clone()).ToList());
+                        stateResults[stateKey] = null;
+                        activeStates.Remove(stateKey);
+                        return true;
+                    }
+
+                    if (availableSeatSum < remainingStudentsCount)
                     {
                         var nextClass = orderedClasses[index];
                         var classLabel = nextClass.ModelClassName ?? nextClass.ModelClassId.ToString();
@@ -3173,6 +3183,80 @@ namespace DTcms.Core.Common.Helpers
                         stateResults[stateKey] = localFailure;
                         activeStates.Remove(stateKey);
                         return false;
+                    }
+
+                    var bestIndex = -1;
+                    List<ClassRoomAllocationOption>? selectedOptions = null;
+                    AIExamModelClass? selectedClass = null;
+                    var bestOptionCount = int.MaxValue;
+                    var bestWasteScore = int.MaxValue;
+
+                    for (var i = index; i < orderedClasses.Count; i++)
+                    {
+                        var candidate = orderedClasses[i];
+
+                        if (candidate.StudentCount <= 0)
+                        {
+                            bestIndex = i;
+                            selectedClass = candidate;
+                            selectedOptions = new List<ClassRoomAllocationOption>
+                            {
+                                new ClassRoomAllocationOption(new List<ClassRoomSlice>(), 0, 0),
+                            };
+                            bestOptionCount = 0;
+                            bestWasteScore = 0;
+                            break;
+                        }
+
+                        var candidateOptions = GenerateClassAllocationOptions(
+                            candidate,
+                            availableRooms,
+                            usedRooms,
+                            null,
+                            12);
+
+                        if (candidateOptions.Count == 0)
+                        {
+                            var label = candidate.ModelClassName ?? candidate.ModelClassId.ToString();
+                            localFailure = $"年级[{grade}]的班级[{label}]无法找到满足规则的考场组合。";
+                            stateResults[stateKey] = localFailure;
+                            activeStates.Remove(stateKey);
+                            return false;
+                        }
+
+                        var optionCount = candidateOptions.Count;
+                        var wasteScore = candidateOptions.Min(option => option.Waste);
+
+                        if (optionCount < bestOptionCount
+                            || (optionCount == bestOptionCount && wasteScore < bestWasteScore)
+                            || (optionCount == bestOptionCount && wasteScore == bestWasteScore
+                                && candidate.StudentCount > (selectedClass?.StudentCount ?? -1)))
+                        {
+                            bestIndex = i;
+                            selectedClass = candidate;
+                            selectedOptions = candidateOptions;
+                            bestOptionCount = optionCount;
+                            bestWasteScore = wasteScore;
+
+                            if (bestOptionCount == 1 && bestWasteScore == 0)
+                            {
+                                break;
+                            }
+                        }
+                    }
+
+                    if (selectedClass == null || selectedOptions == null)
+                    {
+                        localFailure = $"年级[{grade}]没有可用考场满足分配规则。";
+                        stateResults[stateKey] = localFailure;
+                        activeStates.Remove(stateKey);
+                        return false;
+                    }
+
+                    var swapped = bestIndex > index;
+                    if (swapped)
+                    {
+                        (orderedClasses[index], orderedClasses[bestIndex]) = (orderedClasses[bestIndex], orderedClasses[index]);
                     }
 
                     var cls = orderedClasses[index];
@@ -3192,15 +3276,14 @@ namespace DTcms.Core.Common.Helpers
                             stateResults[stateKey] = localFailure;
                         }
                         activeStates.Remove(stateKey);
+                        if (swapped)
+                        {
+                            (orderedClasses[index], orderedClasses[bestIndex]) = (orderedClasses[bestIndex], orderedClasses[index]);
+                        }
                         return finished;
                     }
 
-                    var options = GenerateClassAllocationOptions(
-                        cls,
-                        availableRooms,
-                        usedRooms,
-                        null,
-                        12);
+                    var options = selectedOptions;
 
                     if (options.Count == 0)
                     {
@@ -3246,6 +3329,10 @@ namespace DTcms.Core.Common.Helpers
                         {
                             stateResults[stateKey] = null;
                             activeStates.Remove(stateKey);
+                            if (swapped)
+                            {
+                                (orderedClasses[index], orderedClasses[bestIndex]) = (orderedClasses[bestIndex], orderedClasses[index]);
+                            }
                             return true;
                         }
 
@@ -3269,6 +3356,11 @@ namespace DTcms.Core.Common.Helpers
                     stateResults[stateKey] = localFailure;
                     activeStates.Remove(stateKey);
 
+                    if (swapped)
+                    {
+                        (orderedClasses[index], orderedClasses[bestIndex]) = (orderedClasses[bestIndex], orderedClasses[index]);
+                    }
+
                     return false;
                 }
 
@@ -3283,14 +3375,37 @@ namespace DTcms.Core.Common.Helpers
 
                 string BuildStateKey(int index)
                 {
-                    if (availableRooms.Count == 0)
-                    {
-                        return $"{index}|";
-                    }
-
                     var builder = new StringBuilder();
                     builder.Append(index);
                     builder.Append('|');
+
+                    if (index < orderedClasses.Count)
+                    {
+                        var classIds = new List<int>();
+                        for (var i = index; i < orderedClasses.Count; i++)
+                        {
+                            classIds.Add(orderedClasses[i].ModelClassId);
+                        }
+
+                        classIds.Sort();
+
+                        for (var i = 0; i < classIds.Count; i++)
+                        {
+                            if (i > 0)
+                            {
+                                builder.Append(',');
+                            }
+
+                            builder.Append(classIds[i]);
+                        }
+                    }
+
+                    builder.Append('|');
+
+                    if (availableRooms.Count == 0)
+                    {
+                        return builder.ToString();
+                    }
 
                     var orderedRoomIds = availableRooms.Keys
                         .OrderBy(id => id)
