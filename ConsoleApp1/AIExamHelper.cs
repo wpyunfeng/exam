@@ -1131,6 +1131,13 @@ namespace DTcms.Core.Common.Helpers
 
                             if (!needRetry)
                             {
+                                if (!requiresSessionChange
+                                    && conflictingClasses != null
+                                    && conflictingClasses.Count > 0)
+                                {
+                                    requiresSessionChange = true;
+                                }
+
                                 if (requiresSessionChange)
                                 {
                                     if (sessionRetry == null)
