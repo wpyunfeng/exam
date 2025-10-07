@@ -1091,6 +1091,7 @@ namespace DTcms.Core.Common.Helpers
             var cpModel = new CpModel();
             var assignmentVars = new Dictionary<(int teacherId, int eventIndex), BoolVar>();
             var teacherEventVars = teachers.ToDictionary(t => t.TeacherId, _ => new List<BoolVar>());
+            var genderImbalanceVars = new List<IntVar>();
 
             var eventsByIndex = eventsRequiringTeacher.Select((evt, index) => (evt, index)).ToList();
 
@@ -1098,6 +1099,7 @@ namespace DTcms.Core.Common.Helpers
             {
                 var varsForEvent = new List<BoolVar>();
                 var maleVars = new List<BoolVar>();
+                var femaleVars = new List<BoolVar>();
 
                 foreach (var teacher in teachers)
                 {
@@ -1114,6 +1116,10 @@ namespace DTcms.Core.Common.Helpers
                     if (teacher.Gender == 1)
                     {
                         maleVars.Add(variable);
+                    }
+                    else if (teacher.Gender == 2)
+                    {
+                        femaleVars.Add(variable);
                     }
                 }
 
@@ -1135,14 +1141,21 @@ namespace DTcms.Core.Common.Helpers
                     cpModel.Add(maleCountVar == 0);
                 }
 
-                var femaleCandidateCount = varsForEvent.Count - maleVars.Count;
-                if (maleVars.Count > 0 && femaleCandidateCount > 0)
+                var femaleCountVar = cpModel.NewIntVar(0, evt.Room.TeacherCount, $"female_cnt_{index}");
+                if (femaleVars.Count > 0)
                 {
-                    var minMale = evt.Room.TeacherCount / 2;
-                    var maxMale = (evt.Room.TeacherCount + 1) / 2;
-                    cpModel.Add(maleCountVar >= minMale);
-                    cpModel.Add(maleCountVar <= maxMale);
+                    cpModel.Add(femaleCountVar == LinearExpr.Sum(femaleVars));
                 }
+                else
+                {
+                    cpModel.Add(femaleCountVar == 0);
+                }
+
+                cpModel.Add(maleCountVar + femaleCountVar <= evt.Room.TeacherCount);
+
+                var imbalanceVar = cpModel.NewIntVar(0, evt.Room.TeacherCount, $"gender_imbalance_{index}");
+                cpModel.AddAbsEquality(imbalanceVar, maleCountVar - femaleCountVar);
+                genderImbalanceVars.Add(imbalanceVar);
             }
 
             foreach (var teacher in teachers)
@@ -1210,7 +1223,29 @@ namespace DTcms.Core.Common.Helpers
                 cpModel.Add(load <= maxLoad);
             }
 
-            cpModel.Minimize(maxLoad);
+            var minLoad = cpModel.NewIntVar(0, eventsRequiringTeacher.Count, "min_teacher_load");
+            foreach (var load in teacherLoads.Values)
+            {
+                cpModel.Add(load >= minLoad);
+            }
+
+            var loadSpan = cpModel.NewIntVar(0, eventsRequiringTeacher.Count, "teacher_load_span");
+            cpModel.Add(maxLoad - minLoad <= loadSpan);
+
+            cpModel.Add(minLoad <= maxLoad);
+
+            var objectiveTerms = new List<LinearExpr>
+            {
+                LinearExpr.Term(maxLoad, 1000),
+                LinearExpr.Term(loadSpan, 100)
+            };
+
+            if (genderImbalanceVars.Count > 0)
+            {
+                objectiveTerms.Add(LinearExpr.Sum(genderImbalanceVars));
+            }
+
+            cpModel.Minimize(LinearExpr.Sum(objectiveTerms));
 
             var solver = new CpSolver
             {
