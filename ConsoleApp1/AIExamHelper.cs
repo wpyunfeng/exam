@@ -1166,7 +1166,7 @@ namespace DTcms.Core.Common.Helpers
                     continue;
                 }
 
-                var maxOnePerDay = new Dictionary<string, List<BoolVar>>();
+                var maxOnePerDay = new Dictionary<DateOnly, List<BoolVar>>();
                 var maxOnePerSlot = new Dictionary<int, List<BoolVar>>();
                 foreach (var (evt, index) in eventsByIndex)
                 {
@@ -1175,10 +1175,11 @@ namespace DTcms.Core.Common.Helpers
                         continue;
                     }
 
-                    if (!maxOnePerDay.TryGetValue(evt.Slot.Date, out var list))
+                    var dayKey = DateOnly.FromDateTime(evt.Slot.Start);
+                    if (!maxOnePerDay.TryGetValue(dayKey, out var list))
                     {
                         list = new List<BoolVar>();
-                        maxOnePerDay[evt.Slot.Date] = list;
+                        maxOnePerDay[dayKey] = list;
                     }
 
                     list.Add(variable);
