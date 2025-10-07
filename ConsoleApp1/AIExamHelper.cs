@@ -172,6 +172,27 @@ namespace DTcms.Core.Common.Helpers
                     break;
                 }
 
+                if (retryRequest != null && retryRequest.SubjectIds.Count == 0 && solverSelection != null)
+                {
+                    var fallbackSubjectIds = solverSelection
+                        .Where(kvp =>
+                            filteredCandidateMap.TryGetValue(kvp.Key, out var options)
+                                && kvp.Value >= 0
+                                && kvp.Value < options.Count
+                                && options[kvp.Value].Session.SessionKey == retryRequest.Session.SessionKey)
+                        .Select(kvp => kvp.Key)
+                        .Distinct()
+                        .ToList();
+
+                    if (fallbackSubjectIds.Count > 0)
+                    {
+                        retryRequest = new SessionReassignmentRequest(
+                            retryRequest.Session,
+                            fallbackSubjectIds,
+                            retryRequest.Reason);
+                    }
+                }
+
                 if (retryRequest == null || retryRequest.SubjectIds.Count == 0)
                 {
                     throw new ResponseException(error.ToString(), ErrorCode.ParamError);
