@@ -2385,18 +2385,8 @@ namespace DTcms.Core.Common.Helpers
                     ResetPlannerState();
                     var attemptStart = error.Length;
                     var ordering = strategies[i];
-                    var success = true;
 
-                    foreach (var bucket in ordering)
-                    {
-                        if (!TryAssignGrade(bucket.Grade, bucket.Classes, null, error))
-                        {
-                            success = false;
-                            break;
-                        }
-                    }
-
-                    if (success)
+                    if (TryAssignGradesWithBacktracking(ordering, error))
                     {
                         return true;
                     }
@@ -2492,6 +2482,126 @@ namespace DTcms.Core.Common.Helpers
                 }
 
                 return uniqueStrategies;
+            }
+
+            private bool TryAssignGradesWithBacktracking(List<GradeBucket> ordering, StringBuilder error)
+            {
+                bool Search(int depth, out string? failure)
+                {
+                    failure = null;
+
+                    if (depth >= ordering.Count)
+                    {
+                        return true;
+                    }
+
+                    var bucket = ordering[depth];
+                    var grade = bucket.Grade;
+                    var classes = bucket.Classes;
+                    var triedAvoids = new HashSet<string>(StringComparer.Ordinal);
+
+                    bool Explore(HashSet<int> avoidRooms, out string? exploreFailure)
+                    {
+                        exploreFailure = null;
+
+                        var avoidKey = BuildAvoidKey(avoidRooms);
+                        if (!triedAvoids.Add(avoidKey))
+                        {
+                            return false;
+                        }
+
+                        var attemptStart = error.Length;
+                        if (!TryAssignGrade(grade, classes, avoidRooms.Count > 0 ? avoidRooms : null, error))
+                        {
+                            if (error.Length > attemptStart)
+                            {
+                                exploreFailure = error.ToString(attemptStart, error.Length - attemptStart);
+                            }
+
+                            error.Length = attemptStart;
+                            return false;
+                        }
+
+                        if (Search(depth + 1, out exploreFailure))
+                        {
+                            return true;
+                        }
+
+                        if (error.Length > attemptStart)
+                        {
+                            exploreFailure = error.ToString(attemptStart, error.Length - attemptStart);
+                        }
+
+                        var roomUsage = GetGradeRoomUsage(grade);
+                        RemoveGradeAssignments(grade);
+                        error.Length = attemptStart;
+
+                        var progressed = false;
+
+                        foreach (var usage in roomUsage
+                            .OrderByDescending(u => u.AssignedSeats)
+                            .ThenBy(u => u.RoomId))
+                        {
+                            if (avoidRooms.Contains(usage.RoomId))
+                            {
+                                continue;
+                            }
+
+                            progressed = true;
+
+                            var nextAvoid = new HashSet<int>(avoidRooms) { usage.RoomId };
+                            if (Explore(nextAvoid, out exploreFailure))
+                            {
+                                return true;
+                            }
+                        }
+
+                        if (!progressed && exploreFailure == null)
+                        {
+                            exploreFailure = $"年级[{grade}]没有可用考场满足分配规则。";
+                        }
+
+                        return false;
+                    }
+
+                    if (Explore(new HashSet<int>(), out failure))
+                    {
+                        return true;
+                    }
+
+                    if (string.IsNullOrWhiteSpace(failure))
+                    {
+                        failure = $"年级[{grade}]没有可用考场满足分配规则。";
+                    }
+
+                    return false;
+                }
+
+                if (Search(0, out var failure))
+                {
+                    return true;
+                }
+
+                if (!string.IsNullOrWhiteSpace(failure))
+                {
+                    error.AppendLine(failure);
+                }
+
+                return false;
+            }
+
+            private static string BuildAvoidKey(HashSet<int> avoidRooms)
+            {
+                if (avoidRooms == null || avoidRooms.Count == 0)
+                {
+                    return string.Empty;
+                }
+
+                var ordered = avoidRooms
+                    .OrderBy(id => id)
+                    .ToArray();
+
+                return string.Join(",", ordered);
             }
 
             public bool TryReassignRooms(IEnumerable<int> classIds, Dictionary<int, HashSet<int>>? conflictingRooms, out string? failure)
@@ -3739,6 +3849,46 @@ namespace DTcms.Core.Common.Helpers
 
                     _plans.Remove(classId);
                 }
+            }
+
+            private List<RoomUsage> GetGradeRoomUsage(int grade)
+            {
+                var usage = new Dictionary<int, int>();
+
+                foreach (var cls in _classes.Where(c => c.NJ == grade))
+                {
+                    if (!_plans.TryGetValue(cls.ModelClassId, out var plan) || plan == null)
+                    {
+                        continue;
+                    }
+
+                    foreach (var slice in plan)
+                    {
+                        if (!usage.TryGetValue(slice.RoomId, out var total))
+                        {
+                            total = 0;
+                        }
+
+                        usage[slice.RoomId] = total + Math.Max(0, slice.StudentCount);
+                    }
+                }
+
+                return usage
+                    .Select(kvp => new RoomUsage(kvp.Key, kvp.Value))
+                    .ToList();
+            }
+
+            private readonly struct RoomUsage
+            {
+                public RoomUsage(int roomId, int assignedSeats)
+                {
+                    RoomId = roomId;
+                    AssignedSeats = assignedSeats;
+                }
+
+                public int RoomId { get; }
+
+                public int AssignedSeats { get; }
             }
 
             private Dictionary<int, Dictionary<int, HashSet<int>>> CloneSubjectBans()
