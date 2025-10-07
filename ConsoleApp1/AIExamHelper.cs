@@ -552,6 +552,7 @@ namespace DTcms.Core.Common.Helpers
 
         #region 教室分配
 
+
         private static RoomAssignmentContainer? AllocateRooms(
             List<SubjectInfo> subjects,
             Dictionary<int, RoomInfo> rooms,
@@ -568,71 +569,174 @@ namespace DTcms.Core.Common.Helpers
             container.EventLookup = eventsLookup;
             var classPreferences = new Dictionary<int, ClassRoomPreference>();
 
-            var orderedSubjects = subjects
+            var subjectWithTime = subjects
                 .Where(s => subjectTimeAssignments.ContainsKey(s.SubjectId))
-                .OrderBy(s => s.Priority)
-                .ThenByDescending(s => s.Duration)
-                .ThenByDescending(s => s.Classes.Sum(c => c.StudentCount))
+                .Select(s => new
+                {
+                    Subject = s,
+                    TimeIndex = subjectTimeAssignments[s.SubjectId]
+                })
+                .OrderBy(s => timeSlots[s.TimeIndex].Start)
+                .ThenBy(s => s.Subject.Priority)
+                .ThenByDescending(s => s.Subject.Duration)
                 .ToList();
 
-            foreach (var subject in orderedSubjects)
+            foreach (var group in subjectWithTime.GroupBy(s => s.TimeIndex).OrderBy(g => g.Key))
             {
-                if (!subjectTimeAssignments.TryGetValue(subject.SubjectId, out var timeIndex))
-                {
-                    error.AppendLine($"缺少科目 {subject.Subject.ModelSubjectName ?? subject.SubjectId.ToString()} 的考试时间安排。");
-                    return null;
-                }
-
+                var timeIndex = group.Key;
                 var slot = timeSlots[timeIndex];
-                var candidateRooms = FilterRoomsForSubject(subject, rooms, roomSubjectAllow, roomSubjectBlock, error);
-                if (candidateRooms.Count == 0)
-                {
-                    error.AppendLine($"科目 {subject.Subject.ModelSubjectName ?? subject.SubjectId.ToString()} 没有可用的考场。");
-                    return null;
-                }
-
-                var orderedClasses = subject.Classes
-                    .OrderBy(c => c.Order)
-                    .ThenBy(c => c.Grade)
-                    .ThenByDescending(c => c.StudentCount)
+                var slotSubjects = group.Select(g => g.Subject)
+                    .OrderBy(s => s.Priority)
+                    .ThenByDescending(s => s.Duration)
+                    .ThenByDescending(s => s.Classes.Sum(c => c.StudentCount))
                     .ToList();
 
-                var roomCandidates = candidateRooms
-                    .Select(room => new RoomCandidate
+                var slotRooms = rooms.Values
+                    .Select(room =>
                     {
-                        Room = room,
-                        ExistingEvent = eventsLookup.TryGetValue((slot.Index, room.RoomId), out var evt) ? evt : null
+                        eventsLookup.TryGetValue((timeIndex, room.RoomId), out var evt);
+                        return new RoomCandidate
+                        {
+                            Room = room,
+                            ExistingEvent = evt
+                        };
                     })
-                    .Where(c => c.ExistingEvent == null || c.ExistingEvent.Subject.SubjectId == subject.SubjectId)
-                    .Where(c => c.AvailableSeats > 0)
+                    .Where(candidate => candidate.ExistingEvent == null || slotSubjects.Any(s => s.SubjectId == candidate.ExistingEvent.Subject.SubjectId))
+                    .Where(candidate => candidate.AvailableSeats > 0)
+                    .OrderBy(candidate => candidate.Room.SeatCount)
+                    .ThenBy(candidate => candidate.Room.RoomNo ?? int.MaxValue)
+                    .ThenBy(candidate => candidate.Room.RoomId)
                     .ToList();
 
-                if (roomCandidates.Count == 0)
+                if (slotRooms.Count == 0)
                 {
-                    error.AppendLine($"科目 {subject.Subject.ModelSubjectName ?? subject.SubjectId.ToString()} 在场次 {slot.Date} {slot.Start:HH:mm} 没有可用的考场容量。");
+                    error.AppendLine($"场次 {slot.Date} {slot.Start:HH:mm} 没有可用考场容量。");
                     return null;
                 }
 
-                var allocationResult = SolveRoomAllocationWithCp(subject, orderedClasses, roomCandidates, classPreferences);
-                if (allocationResult == null)
-                {
-                    error.AppendLine($"无法为科目 {subject.Subject.ModelSubjectName ?? subject.SubjectId.ToString()} 的班级整体分配可行的考场方案。");
-                    return null;
-                }
+                var slotClassRequests = new List<SlotClassRequest>();
+                var usedRoomIndices = new HashSet<int>();
 
-                foreach (var cls in orderedClasses)
+                foreach (var subject in slotSubjects)
                 {
-                    if (!allocationResult.ClassAllocations.TryGetValue(cls.Class.ModelClassId, out var allocations) || allocations.Count == 0)
+                    if (!subjectTimeAssignments.TryGetValue(subject.SubjectId, out _))
                     {
-                        error.AppendLine($"无法为科目 {subject.Subject.ModelSubjectName ?? subject.SubjectId.ToString()} 的班级 {cls.Class.ModelClassName ?? cls.Class.ModelClassId.ToString()} 分配考场。");
+                        error.AppendLine($"缺少科目 {subject.Subject.ModelSubjectName ?? subject.SubjectId.ToString()} 的考试时间安排。");
                         return null;
                     }
 
-                    var buildingId = allocationResult.ClassBuilding.TryGetValue(cls.Class.ModelClassId, out var value)
+                    var orderedClasses = subject.Classes
+                        .OrderBy(c => c.Order)
+                        .ThenBy(c => c.Grade)
+                        .ThenByDescending(c => c.StudentCount)
+                        .ToList();
+
+                    foreach (var cls in orderedClasses)
+                    {
+                        var request = new SlotClassRequest
+                        {
+                            Subject = subject,
+                            Class = cls
+                        };
+
+                        for (var roomIndex = 0; roomIndex < slotRooms.Count; roomIndex++)
+                        {
+                            var candidate = slotRooms[roomIndex];
+
+                            if (candidate.ExistingEvent != null && candidate.ExistingEvent.Subject.SubjectId != subject.SubjectId)
+                            {
+                                continue;
+                            }
+
+                            if (!string.IsNullOrWhiteSpace(subject.ExamMode) && !string.Equals(candidate.Room.ExamMode, subject.ExamMode, StringComparison.OrdinalIgnoreCase))
+                            {
+                                continue;
+                            }
+
+                            if (roomSubjectBlock.TryGetValue(subject.SubjectId, out var blocked) && blocked.Contains(candidate.Room.RoomId))
+                            {
+                                continue;
+                            }
+
+                            if (roomSubjectAllow.TryGetValue(subject.SubjectId, out var allowed) && !allowed.Contains(candidate.Room.RoomId))
+                            {
+                                continue;
+                            }
+
+                            request.CandidateRooms.Add(roomIndex);
+                            usedRoomIndices.Add(roomIndex);
+                        }
+
+                        if (request.CandidateRooms.Count == 0)
+                        {
+                            error.AppendLine($"科目 {subject.Subject.ModelSubjectName ?? subject.SubjectId.ToString()} 的班级 {cls.Class.ModelClassName ?? cls.Class.ModelClassId.ToString()} 在 {slot.Date} {slot.Start:HH:mm} 没有可用的考场。");
+                            return null;
+                        }
+
+                        slotClassRequests.Add(request);
+                    }
+                }
+
+                if (usedRoomIndices.Count == 0)
+                {
+                    error.AppendLine($"场次 {slot.Date} {slot.Start:HH:mm} 没有满足条件的考场可用。");
+                    return null;
+                }
+
+                var indexMap = new Dictionary<int, int>();
+                var filteredRooms = new List<RoomCandidate>();
+                for (var originalIndex = 0; originalIndex < slotRooms.Count; originalIndex++)
+                {
+                    if (!usedRoomIndices.Contains(originalIndex))
+                    {
+                        continue;
+                    }
+
+                    indexMap[originalIndex] = filteredRooms.Count;
+                    filteredRooms.Add(slotRooms[originalIndex]);
+                }
+
+                foreach (var request in slotClassRequests)
+                {
+                    for (var i = 0; i < request.CandidateRooms.Count; i++)
+                    {
+                        request.CandidateRooms[i] = indexMap[request.CandidateRooms[i]];
+                    }
+                }
+
+                var allocationResult = SolveSlotRoomAllocationWithCp(slotClassRequests, filteredRooms, classPreferences);
+                if (allocationResult == null)
+                {
+                    if (slotSubjects.Count == 1)
+                    {
+                        var subject = slotSubjects[0];
+                        error.AppendLine($"无法为科目 {subject.Subject.ModelSubjectName ?? subject.SubjectId.ToString()} 的班级整体分配可行的考场方案。");
+                    }
+                    else
+                    {
+                        var subjectNames = string.Join("、", slotSubjects.Select(s => s.Subject.ModelSubjectName ?? s.SubjectId.ToString()));
+                        error.AppendLine($"无法在场次 {slot.Date} {slot.Start:HH:mm} 为科目 {subjectNames} 的班级整体分配可行的考场方案。");
+                    }
+
+                    return null;
+                }
+
+                foreach (var request in slotClassRequests)
+                {
+                    var classId = request.Class.Class.ModelClassId;
+                    var subjectId = request.Subject.SubjectId;
+
+                    if (!allocationResult.ClassAllocations.TryGetValue((subjectId, classId), out var allocations) || allocations.Count == 0)
+                    {
+                        error.AppendLine($"无法为科目 {request.Subject.Subject.ModelSubjectName ?? subjectId.ToString()} 的班级 {request.Class.Class.ModelClassName ?? classId.ToString()} 分配考场。");
+                        return null;
+                    }
+
+                    var buildingId = allocationResult.ClassBuilding.TryGetValue(classId, out var value)
                         ? value
                         : allocations.First().Room.BuildingId;
 
-                    classPreferences[cls.Class.ModelClassId] = new ClassRoomPreference
+                    classPreferences[classId] = new ClassRoomPreference
                     {
                         BuildingId = buildingId,
                         RoomIds = allocations
@@ -641,6 +745,8 @@ namespace DTcms.Core.Common.Helpers
                             .Select(a => a.Room.RoomId)
                             .ToList()
                     };
+
+                    var assignedStudents = 0;
 
                     foreach (var allocation in allocations)
                     {
@@ -651,32 +757,41 @@ namespace DTcms.Core.Common.Helpers
                             {
                                 Room = allocation.Room,
                                 Slot = slot,
-                                Subject = subject
+                                Subject = request.Subject
                             };
                             eventsLookup[key] = roomEvent;
                             container.RoomEvents.Add(roomEvent);
                         }
-                        else if (roomEvent.Subject.SubjectId != subject.SubjectId)
+                        else if (roomEvent.Subject.SubjectId != request.Subject.SubjectId)
                         {
                             error.AppendLine($"考场 {allocation.Room.Room.ModelRoomName ?? allocation.Room.RoomId.ToString()} 在同一场次已分配给其它科目。");
                             return null;
                         }
 
-                        var existingShare = roomEvent.ClassShares.FirstOrDefault(s => s.Class.Class.ModelClassId == cls.Class.ModelClassId);
+                        var existingShare = roomEvent.ClassShares.FirstOrDefault(s => s.Class.Class.ModelClassId == classId);
                         if (existingShare == null)
                         {
                             existingShare = new ClassRoomShare
                             {
-                                Class = cls,
-                                Students = 0
+                                Class = request.Class,
+                                Students = allocation.Students
                             };
                             roomEvent.ClassShares.Add(existingShare);
                         }
+                        else
+                        {
+                            existingShare.Students += allocation.Students;
+                        }
 
-                        existingShare.Students += allocation.Students;
                         roomEvent.TotalStudents += allocation.Students;
 
-                        if (roomEvent.TotalStudents > allocation.Room.SeatCount)
+                        if (roomEvent.TotalStudents > roomEvent.Room.SeatCount)
+                        {
+                            error.AppendLine($"考场 {roomEvent.Room.Room.ModelRoomName ?? roomEvent.Room.RoomId.ToString()} 的学生数量超过座位容量。");
+                            return null;
+                        }
+
+                        if (allocation.Students > allocation.Room.SeatCount)
                         {
                             error.AppendLine($"考场 {allocation.Room.Room.ModelRoomName ?? allocation.Room.RoomId.ToString()} 分配的学生数量超过了座位容量。");
                             return null;
@@ -684,18 +799,19 @@ namespace DTcms.Core.Common.Helpers
 
                         container.ClassAssignments.Add(new ClassRoomAssignment
                         {
-                            Subject = subject,
-                            Class = cls,
+                            Subject = request.Subject,
+                            Class = request.Class,
                             Room = allocation.Room,
                             Slot = slot,
                             Students = allocation.Students
                         });
+
+                        assignedStudents += allocation.Students;
                     }
 
-                    var assignedStudents = allocations.Sum(a => a.Students);
-                    if (assignedStudents != cls.StudentCount)
+                    if (assignedStudents != request.Class.StudentCount)
                     {
-                        error.AppendLine($"班级 {cls.Class.ModelClassName ?? cls.Class.ModelClassId.ToString()} 未完全分配（当前 {assignedStudents}/{cls.StudentCount}）。");
+                        error.AppendLine($"班级 {request.Class.Class.ModelClassName ?? classId.ToString()} 未完全分配（当前 {assignedStudents}/{request.Class.StudentCount}）。");
                         return null;
                     }
                 }
@@ -704,71 +820,46 @@ namespace DTcms.Core.Common.Helpers
             return container;
         }
 
-        private static List<RoomInfo> FilterRoomsForSubject(SubjectInfo subject,
-            Dictionary<int, RoomInfo> rooms,
-            Dictionary<int, HashSet<int>> roomAllowRules,
-            Dictionary<int, HashSet<int>> roomBlockRules,
-            StringBuilder error)
-        {
-            var roomList = new List<RoomInfo>();
-            foreach (var room in rooms.Values)
-            {
-                if (!string.IsNullOrWhiteSpace(subject.ExamMode) && !string.Equals(room.ExamMode, subject.ExamMode, StringComparison.OrdinalIgnoreCase))
-                {
-                    continue;
-                }
-
-                if (roomBlockRules.TryGetValue(subject.SubjectId, out var blocked) && blocked.Contains(room.RoomId))
-                {
-                    continue;
-                }
-
-                if (roomAllowRules.TryGetValue(subject.SubjectId, out var allowed) && !allowed.Contains(room.RoomId))
-                {
-                    continue;
-                }
-
-                roomList.Add(room);
-            }
-
-            return roomList;
-        }
-
-        private static SubjectRoomAllocationResult? SolveRoomAllocationWithCp(
-            SubjectInfo subject,
-            List<ClassInfo> orderedClasses,
+        private static SlotRoomAllocationResult? SolveSlotRoomAllocationWithCp(
+            List<SlotClassRequest> slotClasses,
             List<RoomCandidate> roomCandidates,
             Dictionary<int, ClassRoomPreference> classPreferences)
         {
-            if (orderedClasses.Count == 0 || roomCandidates.Count == 0)
+            if (slotClasses.Count == 0 || roomCandidates.Count == 0)
             {
                 return null;
             }
 
             var cpModel = new CpModel();
-            var classCount = orderedClasses.Count;
+            var classCount = slotClasses.Count;
             var roomCount = roomCandidates.Count;
 
-            var xVars = new IntVar[classCount, roomCount];
-            var yVars = new BoolVar[classCount, roomCount];
+            var xVars = new IntVar?[classCount, roomCount];
+            var yVars = new BoolVar?[classCount, roomCount];
 
             for (var i = 0; i < classCount; i++)
             {
-                for (var j = 0; j < roomCount; j++)
+                var candidates = slotClasses[i].CandidateRooms;
+                if (candidates.Count == 0)
                 {
-                    var capacity = roomCandidates[j].AvailableSeats;
-                    var classId = orderedClasses[i].Class.ModelClassId;
-                    var roomId = roomCandidates[j].Room.RoomId;
+                    return null;
+                }
 
-                    var xVar = cpModel.NewIntVar(0, capacity, $"sub_{subject.SubjectId}_cls_{classId}_room_{roomId}_students");
-                    var yVar = cpModel.NewBoolVar($"sub_{subject.SubjectId}_cls_{classId}_room_{roomId}_use");
+                foreach (var roomIndex in candidates)
+                {
+                    var capacity = roomCandidates[roomIndex].AvailableSeats;
+                    var classId = slotClasses[i].Class.Class.ModelClassId;
+                    var roomId = roomCandidates[roomIndex].Room.RoomId;
+
+                    var xVar = cpModel.NewIntVar(0, capacity, $"slot_cls_{classId}_room_{roomId}_students");
+                    var yVar = cpModel.NewBoolVar($"slot_cls_{classId}_room_{roomId}_use");
 
                     cpModel.Add(xVar <= capacity * yVar);
                     cpModel.Add(xVar >= 1).OnlyEnforceIf(yVar);
                     cpModel.Add(xVar == 0).OnlyEnforceIf(yVar.Not());
 
-                    xVars[i, j] = xVar;
-                    yVars[i, j] = yVar;
+                    xVars[i, roomIndex] = xVar;
+                    yVars[i, roomIndex] = yVar;
                 }
             }
 
@@ -777,10 +868,18 @@ namespace DTcms.Core.Common.Helpers
                 var studentVars = new List<IntVar>();
                 for (var j = 0; j < roomCount; j++)
                 {
-                    studentVars.Add(xVars[i, j]);
+                    if (xVars[i, j] != null)
+                    {
+                        studentVars.Add(xVars[i, j]!);
+                    }
                 }
 
-                cpModel.Add(LinearExpr.Sum(studentVars.ToArray()) == orderedClasses[i].StudentCount);
+                if (studentVars.Count == 0)
+                {
+                    return null;
+                }
+
+                cpModel.Add(LinearExpr.Sum(studentVars.ToArray()) == slotClasses[i].Class.StudentCount);
             }
 
             for (var j = 0; j < roomCount; j++)
@@ -788,15 +887,21 @@ namespace DTcms.Core.Common.Helpers
                 var loadVars = new List<IntVar>();
                 for (var i = 0; i < classCount; i++)
                 {
-                    loadVars.Add(xVars[i, j]);
+                    if (xVars[i, j] != null)
+                    {
+                        loadVars.Add(xVars[i, j]!);
+                    }
                 }
 
-                cpModel.Add(LinearExpr.Sum(loadVars.ToArray()) <= roomCandidates[j].AvailableSeats);
+                if (loadVars.Count > 0)
+                {
+                    cpModel.Add(LinearExpr.Sum(loadVars.ToArray()) <= roomCandidates[j].AvailableSeats);
+                }
             }
 
-            var classesByGrade = orderedClasses
+            var classesByGrade = slotClasses
                 .Select((cls, index) => new { cls, index })
-                .GroupBy(x => x.cls.Grade)
+                .GroupBy(x => x.cls.Class.Grade)
                 .ToDictionary(g => g.Key, g => g.Select(x => x.index).ToList());
 
             for (var j = 0; j < roomCount; j++)
@@ -804,30 +909,25 @@ namespace DTcms.Core.Common.Helpers
                 var gradeVars = new List<BoolVar>();
                 foreach (var kv in classesByGrade)
                 {
-                    var grade = kv.Key;
-                    var indexes = kv.Value;
-                    var gradeVar = cpModel.NewBoolVar($"room_{roomCandidates[j].Room.RoomId}_grade_{grade}");
-
-                    if (indexes.Count == 0)
+                    var relevantIndexes = kv.Value.Where(idx => yVars[idx, j] != null).ToList();
+                    if (relevantIndexes.Count == 0)
                     {
-                        cpModel.Add(gradeVar == 0);
+                        continue;
                     }
-                    else
+
+                    var gradeVar = cpModel.NewBoolVar($"room_{roomCandidates[j].Room.RoomId}_grade_{kv.Key}");
+                    foreach (var idx in relevantIndexes)
                     {
-                        foreach (var idx in indexes)
-                        {
-                            cpModel.Add(yVars[idx, j] <= gradeVar);
-                        }
+                        cpModel.Add(yVars[idx, j]! <= gradeVar);
+                    }
 
-                        var gradeUsage = indexes.Select(idx => yVars[idx, j]).ToArray();
-                        cpModel.Add(gradeVar <= LinearExpr.Sum(gradeUsage));
+                    cpModel.Add(gradeVar <= LinearExpr.Sum(relevantIndexes.Select(idx => yVars[idx, j]!).ToArray()));
 
-                        for (var a = 0; a < indexes.Count; a++)
+                    for (var a = 0; a < relevantIndexes.Count; a++)
+                    {
+                        for (var b = a + 1; b < relevantIndexes.Count; b++)
                         {
-                            for (var b = a + 1; b < indexes.Count; b++)
-                            {
-                                cpModel.Add(yVars[indexes[a], j] + yVars[indexes[b], j] <= 1);
-                            }
+                            cpModel.Add(yVars[relevantIndexes[a], j]! + yVars[relevantIndexes[b], j]! <= 1);
                         }
                     }
 
@@ -837,6 +937,38 @@ namespace DTcms.Core.Common.Helpers
                 if (gradeVars.Count > 0)
                 {
                     cpModel.Add(LinearExpr.Sum(gradeVars.ToArray()) <= 2);
+                }
+            }
+
+            var classesBySubject = slotClasses
+                .Select((cls, index) => new { cls, index })
+                .GroupBy(x => x.cls.Subject.SubjectId)
+                .ToDictionary(g => g.Key, g => g.Select(x => x.index).ToList());
+
+            for (var j = 0; j < roomCount; j++)
+            {
+                var subjectVars = new List<BoolVar>();
+                foreach (var kv in classesBySubject)
+                {
+                    var relevantIndexes = kv.Value.Where(idx => yVars[idx, j] != null).ToList();
+                    if (relevantIndexes.Count == 0)
+                    {
+                        continue;
+                    }
+
+                    var subjectVar = cpModel.NewBoolVar($"room_{roomCandidates[j].Room.RoomId}_subject_{kv.Key}");
+                    foreach (var idx in relevantIndexes)
+                    {
+                        cpModel.Add(yVars[idx, j]! <= subjectVar);
+                    }
+
+                    cpModel.Add(subjectVar <= LinearExpr.Sum(relevantIndexes.Select(idx => yVars[idx, j]!).ToArray()));
+                    subjectVars.Add(subjectVar);
+                }
+
+                if (subjectVars.Count > 0)
+                {
+                    cpModel.Add(LinearExpr.Sum(subjectVars.ToArray()) <= 1);
                 }
             }
 
@@ -855,38 +987,39 @@ namespace DTcms.Core.Common.Helpers
 
                 foreach (var kv in roomsByBuilding)
                 {
-                    var buildingVar = cpModel.NewBoolVar($"cls_{orderedClasses[i].Class.ModelClassId}_building_{kv.Key}");
+                    var candidateIndexes = kv.Value.Where(idx => yVars[i, idx] != null).ToList();
+                    if (candidateIndexes.Count == 0)
+                    {
+                        continue;
+                    }
+
+                    var buildingVar = cpModel.NewBoolVar($"cls_{slotClasses[i].Class.Class.ModelClassId}_building_{kv.Key}");
                     buildingVars[kv.Key] = buildingVar;
 
-                    if (kv.Value.Count == 0)
+                    foreach (var roomIndex in candidateIndexes)
                     {
-                        cpModel.Add(buildingVar == 0);
-                    }
-                    else
-                    {
-                        foreach (var roomIndex in kv.Value)
-                        {
-                            cpModel.Add(yVars[i, roomIndex] <= buildingVar);
-                        }
-
-                        var usage = kv.Value.Select(roomIndex => yVars[i, roomIndex]).ToArray();
-                        cpModel.Add(buildingVar <= LinearExpr.Sum(usage));
+                        cpModel.Add(yVars[i, roomIndex]! <= buildingVar);
                     }
 
+                    cpModel.Add(buildingVar <= LinearExpr.Sum(candidateIndexes.Select(idx => yVars[i, idx]!).ToArray()));
                     buildingVarList.Add(buildingVar);
+                }
+
+                if (buildingVarList.Count == 0)
+                {
+                    return null;
                 }
 
                 cpModel.Add(LinearExpr.Sum(buildingVarList.ToArray()) == 1);
                 classBuildingSelections.Add(buildingVars);
 
-                if (classPreferences.TryGetValue(orderedClasses[i].Class.ModelClassId, out var preference) && preference != null && roomsByBuilding.ContainsKey(preference.BuildingId))
+                if (classPreferences.TryGetValue(slotClasses[i].Class.Class.ModelClassId, out var preference) && preference != null && buildingVars.TryGetValue(preference.BuildingId, out var preferredVar))
                 {
-                    var preferredVar = buildingVars[preference.BuildingId];
-                    var keepPreferred = cpModel.NewBoolVar($"cls_{orderedClasses[i].Class.ModelClassId}_keep_pref_building");
+                    var keepPreferred = cpModel.NewBoolVar($"cls_{slotClasses[i].Class.Class.ModelClassId}_keep_pref_building");
                     cpModel.Add(keepPreferred == 1).OnlyEnforceIf(preferredVar);
                     cpModel.Add(keepPreferred == 0).OnlyEnforceIf(preferredVar.Not());
 
-                    var changePreferred = cpModel.NewBoolVar($"cls_{orderedClasses[i].Class.ModelClassId}_change_pref_building");
+                    var changePreferred = cpModel.NewBoolVar($"cls_{slotClasses[i].Class.Class.ModelClassId}_change_pref_building");
                     cpModel.Add(changePreferred + keepPreferred == 1);
                     preferencePenaltyVars.Add(changePreferred);
                 }
@@ -900,9 +1033,20 @@ namespace DTcms.Core.Common.Helpers
                 var load = new List<IntVar>();
                 for (var i = 0; i < classCount; i++)
                 {
-                    load.Add(xVars[i, j]);
+                    if (xVars[i, j] != null)
+                    {
+                        load.Add(xVars[i, j]!);
+                    }
                 }
-                cpModel.Add(usageVar == LinearExpr.Sum(load.ToArray()));
+
+                if (load.Count == 0)
+                {
+                    cpModel.Add(usageVar == 0);
+                }
+                else
+                {
+                    cpModel.Add(usageVar == LinearExpr.Sum(load.ToArray()));
+                }
 
                 var wasteVar = cpModel.NewIntVar(0, capacity, $"room_{roomCandidates[j].Room.RoomId}_waste");
                 cpModel.Add(wasteVar == capacity - usageVar);
@@ -912,13 +1056,21 @@ namespace DTcms.Core.Common.Helpers
             var roomUsageVars = new List<IntVar>();
             for (var i = 0; i < classCount; i++)
             {
-                var usageIndicators = new List<IntVar>();
+                var usageIndicators = new List<BoolVar>();
                 for (var j = 0; j < roomCount; j++)
                 {
-                    usageIndicators.Add(yVars[i, j]);
+                    if (yVars[i, j] != null)
+                    {
+                        usageIndicators.Add(yVars[i, j]!);
+                    }
                 }
 
-                var roomCountVar = cpModel.NewIntVar(1, roomCount, $"cls_{orderedClasses[i].Class.ModelClassId}_room_count");
+                if (usageIndicators.Count == 0)
+                {
+                    return null;
+                }
+
+                var roomCountVar = cpModel.NewIntVar(1, usageIndicators.Count, $"cls_{slotClasses[i].Class.Class.ModelClassId}_room_count");
                 cpModel.Add(roomCountVar == LinearExpr.Sum(usageIndicators.ToArray()));
                 roomUsageVars.Add(roomCountVar);
             }
@@ -959,15 +1111,21 @@ namespace DTcms.Core.Common.Helpers
                 return null;
             }
 
-            var result = new SubjectRoomAllocationResult();
+            var result = new SlotRoomAllocationResult();
             for (var i = 0; i < classCount; i++)
             {
-                var cls = orderedClasses[i];
+                var request = slotClasses[i];
                 var allocations = new List<RoomAllocation>();
 
-                for (var j = 0; j < roomCount; j++)
+                foreach (var roomIndex in request.CandidateRooms)
                 {
-                    var assigned = (int)solver.Value(xVars[i, j]);
+                    var variable = xVars[i, roomIndex];
+                    if (variable == null)
+                    {
+                        continue;
+                    }
+
+                    var assigned = (int)solver.Value(variable);
                     if (assigned <= 0)
                     {
                         continue;
@@ -975,9 +1133,9 @@ namespace DTcms.Core.Common.Helpers
 
                     allocations.Add(new RoomAllocation
                     {
-                        Room = roomCandidates[j].Room,
+                        Room = roomCandidates[roomIndex].Room,
                         Students = assigned,
-                        ExistingEvent = roomCandidates[j].ExistingEvent
+                        ExistingEvent = roomCandidates[roomIndex].ExistingEvent
                     });
                 }
 
@@ -986,14 +1144,17 @@ namespace DTcms.Core.Common.Helpers
                     return null;
                 }
 
-                result.ClassAllocations[cls.Class.ModelClassId] = allocations;
+                result.ClassAllocations[(request.Subject.SubjectId, request.Class.Class.ModelClassId)] = allocations;
 
-                foreach (var kv in classBuildingSelections[i])
+                if (classBuildingSelections.Count > i)
                 {
-                    if (solver.Value(kv.Value) == 1)
+                    foreach (var kv in classBuildingSelections[i])
                     {
-                        result.ClassBuilding[cls.Class.ModelClassId] = kv.Key;
-                        break;
+                        if (solver.Value(kv.Value) == 1)
+                        {
+                            result.ClassBuilding[request.Class.Class.ModelClassId] = kv.Key;
+                            break;
+                        }
                     }
                 }
             }
@@ -1557,9 +1718,16 @@ namespace DTcms.Core.Common.Helpers
             public RoomEvent? ExistingEvent { get; set; }
         }
 
-        private sealed class SubjectRoomAllocationResult
+        private sealed class SlotClassRequest
         {
-            public Dictionary<int, List<RoomAllocation>> ClassAllocations { get; } = new Dictionary<int, List<RoomAllocation>>();
+            public SubjectInfo Subject { get; set; } = null!;
+            public ClassInfo Class { get; set; } = null!;
+            public List<int> CandidateRooms { get; set; } = new List<int>();
+        }
+
+        private sealed class SlotRoomAllocationResult
+        {
+            public Dictionary<(int subjectId, int classId), List<RoomAllocation>> ClassAllocations { get; } = new Dictionary<(int subjectId, int classId), List<RoomAllocation>>();
             public Dictionary<int, int> ClassBuilding { get; } = new Dictionary<int, int>();
         }
 
