@@ -3118,6 +3118,7 @@ namespace DTcms.Core.Common.Helpers
 
                 var currentPlan = new Dictionary<int, List<ClassRoomSlice>>();
                 var usedRooms = new HashSet<int>();
+                var visitedStates = new HashSet<string>();
                 Dictionary<int, List<ClassRoomSlice>>? bestPlan = null;
 
                 bool Search(int index, out string? localFailure)
@@ -3130,6 +3131,15 @@ namespace DTcms.Core.Common.Helpers
                             kvp => kvp.Key,
                             kvp => kvp.Value.Select(slice => slice.Clone()).ToList());
                         return true;
+                    }
+
+                    var stateKey = BuildStateKey(index);
+                    if (!visitedStates.Add(stateKey))
+                    {
+                        var repeatedClass = orderedClasses[index];
+                        var repeatedLabel = repeatedClass.ModelClassName ?? repeatedClass.ModelClassId.ToString();
+                        localFailure = $"年级[{grade}]的班级[{repeatedLabel}]无法找到满足规则的考场组合。";
+                        return false;
                     }
 
                     var cls = orderedClasses[index];
@@ -3224,6 +3234,34 @@ namespace DTcms.Core.Common.Helpers
 
                 gradePlans = new Dictionary<int, List<ClassRoomSlice>>();
                 return false;
+
+                string BuildStateKey(int index)
+                {
+                    if (availableRooms.Count == 0)
+                    {
+                        return $"{index}|";
+                    }
+
+                    var builder = new StringBuilder();
+                    builder.Append(index);
+                    builder.Append('|');
+
+                    var orderedRoomIds = availableRooms.Keys
+                        .OrderBy(id => id)
+                        .ToList();
+
+                    for (var i = 0; i < orderedRoomIds.Count; i++)
+                    {
+                        if (i > 0)
+                        {
+                            builder.Append(',');
+                        }
+
+                        builder.Append(orderedRoomIds[i]);
+                    }
+
+                    return builder.ToString();
+                }
             }
 
             private List<ClassRoomAllocationOption> GenerateClassAllocationOptions(
