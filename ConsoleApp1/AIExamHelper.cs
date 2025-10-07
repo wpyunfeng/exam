@@ -2357,26 +2357,141 @@ namespace DTcms.Core.Common.Helpers
 
             private bool Initialize(StringBuilder error)
             {
-                _plans.Clear();
-                _roomGradeUsage.Clear();
-                _roomSeatUsage.Clear();
-                _subjectOverrides.Clear();
-                _subjectRoomBans.Clear();
+                ResetPlannerState();
 
                 if (_classes.Count == 0 || _rooms.Count == 0)
                 {
                     return true;
                 }
 
-                foreach (var gradeGroup in _classes.GroupBy(c => c.NJ).OrderBy(g => g.Key))
+                var gradeBuckets = _classes
+                    .GroupBy(c => c.NJ)
+                    .Select(g => new GradeBucket(g.Key, g.ToList()))
+                    .ToList();
+
+                if (gradeBuckets.Count == 0)
                 {
-                    if (!TryAssignGrade(gradeGroup.Key, gradeGroup.ToList(), null, error))
+                    return true;
+                }
+
+                var strategies = BuildGradeStrategies(gradeBuckets);
+                if (strategies.Count == 0)
+                {
+                    strategies.Add(gradeBuckets.OrderBy(b => b.Grade).ToList());
+                }
+
+                for (var i = 0; i < strategies.Count; i++)
+                {
+                    ResetPlannerState();
+                    var attemptStart = error.Length;
+                    var ordering = strategies[i];
+                    var success = true;
+
+                    foreach (var bucket in ordering)
                     {
-                        return false;
+                        if (!TryAssignGrade(bucket.Grade, bucket.Classes, null, error))
+                        {
+                            success = false;
+                            break;
+                        }
+                    }
+
+                    if (success)
+                    {
+                        return true;
+                    }
+
+                    if (i < strategies.Count - 1)
+                    {
+                        error.Length = attemptStart;
                     }
                 }
 
-                return true;
+                ResetPlannerState();
+                return false;
+            }
+
+            private void ResetPlannerState()
+            {
+                _plans.Clear();
+                _roomGradeUsage.Clear();
+                _roomSeatUsage.Clear();
+                _subjectOverrides.Clear();
+                _subjectRoomBans.Clear();
+            }
+
+            private sealed class GradeBucket
+            {
+                public GradeBucket(int grade, List<AIExamModelClass> classes)
+                {
+                    Grade = grade;
+                    Classes = classes ?? new List<AIExamModelClass>();
+                    TotalStudents = Classes.Sum(c => Math.Max(0, c.StudentCount));
+                    MaxClassSize = Classes.Count == 0
+                        ? 0
+                        : Classes.Max(c => Math.Max(0, c.StudentCount));
+                    AverageClassSize = Classes.Count == 0
+                        ? 0
+                        : (double)TotalStudents / Classes.Count;
+                    ClassCount = Classes.Count;
+                }
+
+                public int Grade { get; }
+
+                public List<AIExamModelClass> Classes { get; }
+
+                public int TotalStudents { get; }
+
+                public int MaxClassSize { get; }
+
+                public double AverageClassSize { get; }
+
+                public int ClassCount { get; }
+            }
+
+            private List<List<GradeBucket>> BuildGradeStrategies(List<GradeBucket> buckets)
+            {
+                var strategies = new List<List<GradeBucket>>();
+                if (buckets == null || buckets.Count == 0)
+                {
+                    return strategies;
+                }
+
+                strategies.Add(buckets.OrderBy(b => b.Grade).ToList());
+                strategies.Add(buckets
+                    .OrderByDescending(b => b.TotalStudents)
+                    .ThenByDescending(b => b.MaxClassSize)
+                    .ThenBy(b => b.Grade)
+                    .ToList());
+                strategies.Add(buckets
+                    .OrderByDescending(b => b.MaxClassSize)
+                    .ThenByDescending(b => b.TotalStudents)
+                    .ThenBy(b => b.Grade)
+                    .ToList());
+                strategies.Add(buckets
+                    .OrderByDescending(b => b.AverageClassSize)
+                    .ThenByDescending(b => b.TotalStudents)
+                    .ThenBy(b => b.Grade)
+                    .ToList());
+                strategies.Add(buckets
+                    .OrderByDescending(b => b.ClassCount)
+                    .ThenByDescending(b => b.TotalStudents)
+                    .ThenBy(b => b.Grade)
+                    .ToList());
+
+                var uniqueStrategies = new List<List<GradeBucket>>();
+                var seen = new HashSet<string>();
+
+                foreach (var strategy in strategies)
+                {
+                    var key = string.Join(",", strategy.Select(b => b.Grade));
+                    if (seen.Add(key))
+                    {
+                        uniqueStrategies.Add(strategy);
+                    }
+                }
+
+                return uniqueStrategies;
             }
 
             public bool TryReassignRooms(IEnumerable<int> classIds, Dictionary<int, HashSet<int>>? conflictingRooms, out string? failure)
