@@ -926,17 +926,17 @@ namespace DTcms.Core.Common.Helpers
             var objectiveTerms = new List<LinearExpr>();
             if (seatWasteVars.Count > 0)
             {
-                objectiveTerms.Add(LinearExpr.ScalProd(seatWasteVars.ToArray(), Enumerable.Repeat(5, seatWasteVars.Count).ToArray()));
+                objectiveTerms.Add(LinearExpr.Sum(seatWasteVars.Select(v => v * 5L).ToArray()));
             }
 
             if (roomUsageVars.Count > 0)
             {
-                objectiveTerms.Add(LinearExpr.ScalProd(roomUsageVars.ToArray(), Enumerable.Repeat(20, roomUsageVars.Count).ToArray()));
+                objectiveTerms.Add(LinearExpr.Sum(roomUsageVars.Select(v => v * 20L).ToArray()));
             }
 
             if (preferencePenaltyVars.Count > 0)
             {
-                objectiveTerms.Add(LinearExpr.ScalProd(preferencePenaltyVars.ToArray(), Enumerable.Repeat(50, preferencePenaltyVars.Count).ToArray()));
+                objectiveTerms.Add(LinearExpr.Sum(preferencePenaltyVars.Select(v => v * 50L).ToArray()));
             }
 
             if (objectiveTerms.Count > 0)
