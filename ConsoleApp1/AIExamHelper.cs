@@ -639,13 +639,17 @@ namespace DTcms.Core.Common.Helpers
                         var existingShare = roomEvent.ClassShares.FirstOrDefault(s => s.Class.Class.ModelClassId == cls.Class.ModelClassId);
                         if (existingShare == null)
                         {
-                            if (roomEvent.ClassShares.Count >= 2)
+                            var existingGrades = roomEvent.ClassShares
+                                .Select(s => s.Class.Grade)
+                                .ToHashSet();
+
+                            if (!existingGrades.Contains(cls.Grade) && existingGrades.Count >= 2)
                             {
-                                error.AppendLine($"考场 {allocation.Room.Room.ModelRoomName ?? allocation.Room.RoomId.ToString()} 在场次 {slot.Date} {slot.Start:HH:mm} 已达到班级数量上限。");
+                                error.AppendLine($"考场 {allocation.Room.Room.ModelRoomName ?? allocation.Room.RoomId.ToString()} 在场次 {slot.Date} {slot.Start:HH:mm} 已达到可容纳年级数量上限。");
                                 return null;
                             }
 
-                            if (roomEvent.ClassShares.Any(s => s.Class.Grade == cls.Grade && s.Class.Class.ModelClassId != cls.Class.ModelClassId))
+                            if (existingGrades.Contains(cls.Grade) && roomEvent.ClassShares.Any(s => s.Class.Class.ModelClassId != cls.Class.ModelClassId && s.Class.Grade == cls.Grade))
                             {
                                 error.AppendLine($"考场 {allocation.Room.Room.ModelRoomName ?? allocation.Room.RoomId.ToString()} 已安排相同年级的其它班级，无法再安排班级 {cls.Class.ModelClassName ?? cls.Class.ModelClassId.ToString()}。");
                                 return null;
@@ -909,11 +913,6 @@ namespace DTcms.Core.Common.Helpers
                 remaining -= 1;
             }
 
-            if (!AreAllocationsAdjacent(allocations))
-            {
-                return null;
-            }
-
             var seatWaste = allocations.Sum(a =>
             {
                 var used = (a.ExistingEvent?.TotalStudents ?? 0) + a.Students;
@@ -925,6 +924,7 @@ namespace DTcms.Core.Common.Helpers
             var balancePenalty = allocations.Count > 1
                 ? allocations.Max(a => a.Students) - allocations.Min(a => a.Students)
                 : 0;
+            var adjacencyPenalty = CalculateAdjacencyPenalty(allocations);
 
             return new RoomAllocationPlan
             {
@@ -933,7 +933,8 @@ namespace DTcms.Core.Common.Helpers
                 RoomCount = allocations.Count,
                 MaxRoomCapacity = allocations.Max(a => a.Room.SeatCount),
                 RoomNoSpread = spread,
-                BalancePenalty = balancePenalty
+                BalancePenalty = balancePenalty,
+                AdjacencyPenalty = adjacencyPenalty
             };
         }
 
@@ -949,12 +950,16 @@ namespace DTcms.Core.Common.Helpers
                 return false;
             }
 
-            if (candidate.ExistingEvent.ClassShares.Any(s => s.Class.Grade == cls.Grade && s.Class.Class.ModelClassId != cls.Class.ModelClassId))
+            var distinctGrades = candidate.ExistingEvent.ClassShares
+                .Select(s => s.Class.Grade)
+                .ToHashSet();
+
+            if (distinctGrades.Contains(cls.Grade) && candidate.ExistingEvent.ClassShares.Any(s => s.Class.Class.ModelClassId != cls.Class.ModelClassId && s.Class.Grade == cls.Grade))
             {
                 return false;
             }
 
-            if (candidate.ExistingEvent.ClassShares.Count >= 2 && candidate.ExistingEvent.ClassShares.All(s => s.Class.Class.ModelClassId != cls.Class.ModelClassId))
+            if (!distinctGrades.Contains(cls.Grade) && distinctGrades.Count >= 2)
             {
                 return false;
             }
@@ -962,16 +967,16 @@ namespace DTcms.Core.Common.Helpers
             return candidate.AvailableSeats > 0;
         }
 
-        private static bool AreAllocationsAdjacent(List<RoomAllocation> allocations)
+        private static int CalculateAdjacencyPenalty(List<RoomAllocation> allocations)
         {
             if (allocations.Count <= 1)
             {
-                return true;
+                return 0;
             }
 
             if (allocations.Any(a => !a.Room.RoomNo.HasValue))
             {
-                return true;
+                return 0;
             }
 
             var ordered = allocations
@@ -979,15 +984,17 @@ namespace DTcms.Core.Common.Helpers
                 .OrderBy(n => n)
                 .ToList();
 
+            var penalty = 0;
             for (var i = 1; i < ordered.Count; i++)
             {
-                if (ordered[i] - ordered[i - 1] > 1)
+                var gap = ordered[i] - ordered[i - 1];
+                if (gap > 1)
                 {
-                    return false;
+                    penalty += gap - 1;
                 }
             }
 
-            return true;
+            return penalty;
         }
 
         private static bool IsBetterPlan(RoomAllocationPlan candidate, RoomAllocationPlan current)
@@ -1000,6 +1007,11 @@ namespace DTcms.Core.Common.Helpers
             if (!candidate.UsedPreferredRooms && current.UsedPreferredRooms)
             {
                 return false;
+            }
+
+            if (candidate.AdjacencyPenalty != current.AdjacencyPenalty)
+            {
+                return candidate.AdjacencyPenalty < current.AdjacencyPenalty;
             }
 
             if (candidate.SeatWaste != current.SeatWaste)
@@ -1594,6 +1606,7 @@ namespace DTcms.Core.Common.Helpers
             public int MaxRoomCapacity { get; set; }
             public int RoomNoSpread { get; set; }
             public int BalancePenalty { get; set; }
+            public int AdjacencyPenalty { get; set; }
             public int BuildingId { get; set; }
             public bool UsedPreferredRooms { get; set; }
         }
