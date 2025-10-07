@@ -1166,7 +1166,7 @@ namespace DTcms.Core.Common.Helpers
                     continue;
                 }
 
-                var maxOnePerDay = new Dictionary<DateOnly, List<BoolVar>>();
+                var dayRoomEvents = new Dictionary<DateOnly, Dictionary<int, List<BoolVar>>>();
                 var maxOnePerSlot = new Dictionary<int, List<BoolVar>>();
                 foreach (var (evt, index) in eventsByIndex)
                 {
@@ -1176,13 +1176,19 @@ namespace DTcms.Core.Common.Helpers
                     }
 
                     var dayKey = DateOnly.FromDateTime(evt.Slot.Start);
-                    if (!maxOnePerDay.TryGetValue(dayKey, out var list))
+                    if (!dayRoomEvents.TryGetValue(dayKey, out var roomMap))
                     {
-                        list = new List<BoolVar>();
-                        maxOnePerDay[dayKey] = list;
+                        roomMap = new Dictionary<int, List<BoolVar>>();
+                        dayRoomEvents[dayKey] = roomMap;
                     }
 
-                    list.Add(variable);
+                    if (!roomMap.TryGetValue(evt.Room.RoomId, out var eventList))
+                    {
+                        eventList = new List<BoolVar>();
+                        roomMap[evt.Room.RoomId] = eventList;
+                    }
+
+                    eventList.Add(variable);
 
                     if (!maxOnePerSlot.TryGetValue(evt.Slot.Index, out var slotList))
                     {
@@ -1193,7 +1199,32 @@ namespace DTcms.Core.Common.Helpers
                     slotList.Add(variable);
                 }
 
-                foreach (var kv in maxOnePerDay)
+                var dayRoomSelectionVars = new Dictionary<DateOnly, List<BoolVar>>();
+                foreach (var (day, roomMap) in dayRoomEvents)
+                {
+                    foreach (var (roomId, eventList) in roomMap)
+                    {
+                        var dayLabel = day.ToString("yyyyMMdd", CultureInfo.InvariantCulture);
+                        var dayRoomVar = cpModel.NewBoolVar($"teacher_{teacher.TeacherId}_day_{dayLabel}_room_{roomId}");
+
+                        foreach (var evtVar in eventList)
+                        {
+                            cpModel.Add(evtVar <= dayRoomVar);
+                        }
+
+                        cpModel.Add(dayRoomVar <= LinearExpr.Sum(eventList));
+
+                        if (!dayRoomSelectionVars.TryGetValue(day, out var selectionList))
+                        {
+                            selectionList = new List<BoolVar>();
+                            dayRoomSelectionVars[day] = selectionList;
+                        }
+
+                        selectionList.Add(dayRoomVar);
+                    }
+                }
+
+                foreach (var kv in dayRoomSelectionVars)
                 {
                     cpModel.Add(LinearExpr.Sum(kv.Value) <= 1);
                 }
