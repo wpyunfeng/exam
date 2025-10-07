@@ -868,7 +868,7 @@ namespace DTcms.Core.Common.Helpers
                 var studentVars = new List<IntVar>();
                 for (var j = 0; j < roomCount; j++)
                 {
-                    if (xVars[i, j] != null)
+                    if (xVars[i, j] is not null)
                     {
                         studentVars.Add(xVars[i, j]!);
                     }
@@ -887,7 +887,7 @@ namespace DTcms.Core.Common.Helpers
                 var loadVars = new List<IntVar>();
                 for (var i = 0; i < classCount; i++)
                 {
-                    if (xVars[i, j] != null)
+                    if (xVars[i, j] is not null)
                     {
                         loadVars.Add(xVars[i, j]!);
                     }
@@ -909,7 +909,7 @@ namespace DTcms.Core.Common.Helpers
                 var gradeVars = new List<BoolVar>();
                 foreach (var kv in classesByGrade)
                 {
-                    var relevantIndexes = kv.Value.Where(idx => yVars[idx, j] != null).ToList();
+                    var relevantIndexes = kv.Value.Where(idx => yVars[idx, j] is not null).ToList();
                     if (relevantIndexes.Count == 0)
                     {
                         continue;
@@ -950,7 +950,7 @@ namespace DTcms.Core.Common.Helpers
                 var subjectVars = new List<BoolVar>();
                 foreach (var kv in classesBySubject)
                 {
-                    var relevantIndexes = kv.Value.Where(idx => yVars[idx, j] != null).ToList();
+                    var relevantIndexes = kv.Value.Where(idx => yVars[idx, j] is not null).ToList();
                     if (relevantIndexes.Count == 0)
                     {
                         continue;
@@ -987,7 +987,7 @@ namespace DTcms.Core.Common.Helpers
 
                 foreach (var kv in roomsByBuilding)
                 {
-                    var candidateIndexes = kv.Value.Where(idx => yVars[i, idx] != null).ToList();
+                    var candidateIndexes = kv.Value.Where(idx => yVars[i, idx] is not null).ToList();
                     if (candidateIndexes.Count == 0)
                     {
                         continue;
@@ -1033,7 +1033,7 @@ namespace DTcms.Core.Common.Helpers
                 var load = new List<IntVar>();
                 for (var i = 0; i < classCount; i++)
                 {
-                    if (xVars[i, j] != null)
+                    if (xVars[i, j] is not null)
                     {
                         load.Add(xVars[i, j]!);
                     }
@@ -1059,7 +1059,7 @@ namespace DTcms.Core.Common.Helpers
                 var usageIndicators = new List<BoolVar>();
                 for (var j = 0; j < roomCount; j++)
                 {
-                    if (yVars[i, j] != null)
+                    if (yVars[i, j] is not null)
                     {
                         usageIndicators.Add(yVars[i, j]!);
                     }
