@@ -856,3 +856,4 @@ F:\程序\储仁培训\数字校园综合管理平台8.0\排考\ConsoleApp1\obj\
 F:\程序\储仁培训\数字校园综合管理平台8.0\排考\ConsoleApp1\obj\Debug\net8.0\ConsoleApp1.pdb
 F:\程序\储仁培训\数字校园综合管理平台8.0\排考\ConsoleApp1\obj\Debug\net8.0\ConsoleApp1.genruntimeconfig.cache
 F:\程序\储仁培训\数字校园综合管理平台8.0\排考\ConsoleApp1\obj\Debug\net8.0\ref\ConsoleApp1.dll
+F:\程序\储仁培训\数字校园综合管理平台8.0\排考\ConsoleApp1\obj\Debug\net8.0\ConsoleApp1.sourcelink.json
