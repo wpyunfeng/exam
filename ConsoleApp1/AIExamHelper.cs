@@ -709,6 +709,7 @@ namespace DTcms.Core.Common.Helpers
 
                 var slotClassRequests = new List<SlotClassRequest>();
                 var usedRoomIndices = new HashSet<int>();
+                var classesNeedingPreferenceReset = new HashSet<int>();
 
                 foreach (var subject in slotSubjects)
                 {
@@ -731,6 +732,8 @@ namespace DTcms.Core.Common.Helpers
                             Subject = subject,
                             Class = cls
                         };
+
+                        var candidateIndices = new List<int>();
 
                         for (var roomIndex = 0; roomIndex < slotRooms.Count; roomIndex++)
                         {
@@ -756,14 +759,46 @@ namespace DTcms.Core.Common.Helpers
                                 continue;
                             }
 
-                            request.CandidateRooms.Add(roomIndex);
-                            usedRoomIndices.Add(roomIndex);
+                            candidateIndices.Add(roomIndex);
                         }
 
-                        if (request.CandidateRooms.Count == 0)
+                        if (candidateIndices.Count == 0)
                         {
                             error.AppendLine($"科目 {subject.Subject.ModelSubjectName ?? subject.SubjectId.ToString()} 的班级 {cls.Class.ModelClassName ?? cls.Class.ModelClassId.ToString()} 在 {slot.Date} {slot.Start:HH:mm} 没有可用的考场。");
                             return null;
+                        }
+
+                        var finalCandidates = candidateIndices;
+                        var classId = cls.Class.ModelClassId;
+
+                        if (classPreferences.TryGetValue(classId, out var preference))
+                        {
+                            var preferredRoomSet = preference.RoomIds.ToHashSet();
+                            var preferredCandidates = candidateIndices
+                                .Where(idx => slotRooms[idx].Room.BuildingId == preference.BuildingId && preferredRoomSet.Contains(slotRooms[idx].Room.RoomId))
+                                .ToList();
+
+                            var preferredSeatCount = preferredCandidates.Sum(idx => slotRooms[idx].AvailableSeats);
+
+                            if (preferredCandidates.Count == preference.RoomIds.Count &&
+                                preference.RoomIds.All(id => preferredCandidates.Any(idx => slotRooms[idx].Room.RoomId == id)) &&
+                                preferredSeatCount >= cls.StudentCount)
+                            {
+                                finalCandidates = preferredCandidates
+                                    .OrderBy(idx => preference.RoomIds.IndexOf(slotRooms[idx].Room.RoomId))
+                                    .ToList();
+                            }
+                            else
+                            {
+                                classesNeedingPreferenceReset.Add(classId);
+                            }
+                        }
+
+                        request.CandidateRooms = finalCandidates;
+
+                        foreach (var idx in finalCandidates)
+                        {
+                            usedRoomIndices.Add(idx);
                         }
 
                         slotClassRequests.Add(request);
@@ -774,6 +809,11 @@ namespace DTcms.Core.Common.Helpers
                 {
                     error.AppendLine($"场次 {slot.Date} {slot.Start:HH:mm} 没有满足条件的考场可用。");
                     return null;
+                }
+
+                foreach (var classId in classesNeedingPreferenceReset)
+                {
+                    classPreferences.Remove(classId);
                 }
 
                 var indexMap = new Dictionary<int, int>();
