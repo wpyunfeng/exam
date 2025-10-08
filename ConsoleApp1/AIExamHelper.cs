@@ -87,7 +87,7 @@ namespace DTcms.Core.Common.Helpers
                     throw new ResponseException(error.ToString(), ErrorCode.ParamError);
                 }
 
-                roomAssignments = AllocateRooms(subjects, rooms, timeSlots, subjectTimeAssignments, model, out var conflict, error);
+                roomAssignments = AllocateRooms(subjects, rooms, timeSlots, subjectTimeAssignments, model, config, out var conflict, error);
                 if (roomAssignments != null)
                 {
                     break;
@@ -450,6 +450,11 @@ namespace DTcms.Core.Common.Helpers
                 }
             }
 
+            foreach (var kv in subjectStartVars)
+            {
+                result.SubjectStartOffsets[kv.Key] = (int)solver.Value(kv.Value);
+            }
+
             return result;
         }
 
@@ -664,6 +669,7 @@ namespace DTcms.Core.Common.Helpers
             List<TimeSlotInfo> timeSlots,
             Dictionary<int, int> subjectTimeAssignments,
             AIExamModel model,
+            AIExamConfig config,
             out SlotTimeConflict? conflict,
             StringBuilder error)
         {
@@ -672,7 +678,7 @@ namespace DTcms.Core.Common.Helpers
             var roomSubjectBlock = BuildSubjectRoomRule(model.RuleRoomSubjectNotList);
 
             var container = new RoomAssignmentContainer();
-            var eventsLookup = new Dictionary<(int timeIndex, int roomId), RoomEvent>();
+            var eventsLookup = new Dictionary<(int timeIndex, int roomId), List<RoomEvent>>();
             container.EventLookup = eventsLookup;
             var classPreferences = new Dictionary<int, ClassRoomPreference>();
 
@@ -699,16 +705,10 @@ namespace DTcms.Core.Common.Helpers
                     .ToList();
 
                 var slotRooms = rooms.Values
-                    .Select(room =>
+                    .Select(room => new RoomCandidate
                     {
-                        eventsLookup.TryGetValue((timeIndex, room.RoomId), out var evt);
-                        return new RoomCandidate
-                        {
-                            Room = room,
-                            ExistingEvent = evt
-                        };
+                        Room = room
                     })
-                    .Where(candidate => candidate.ExistingEvent == null || slotSubjects.Any(s => s.SubjectId == candidate.ExistingEvent.Subject.SubjectId))
                     .Where(candidate => candidate.AvailableSeats > 0)
                     .OrderBy(candidate => candidate.Room.SeatCount)
                     .ThenBy(candidate => candidate.Room.RoomNo ?? int.MaxValue)
@@ -751,11 +751,6 @@ namespace DTcms.Core.Common.Helpers
                         for (var roomIndex = 0; roomIndex < slotRooms.Count; roomIndex++)
                         {
                             var candidate = slotRooms[roomIndex];
-
-                            if (candidate.ExistingEvent != null && candidate.ExistingEvent.Subject.SubjectId != subject.SubjectId)
-                            {
-                                continue;
-                            }
 
                             if (!string.IsNullOrWhiteSpace(subject.ExamMode) && !string.Equals(candidate.Room.ExamMode, subject.ExamMode, StringComparison.OrdinalIgnoreCase))
                             {
@@ -843,7 +838,36 @@ namespace DTcms.Core.Common.Helpers
                     }
                 }
 
-                var allocationResult = SolveSlotRoomAllocationWithCp(slotClassRequests, filteredRooms, classPreferences);
+                var baseRequests = slotClassRequests
+                    .Select(CloneSlotClassRequest)
+                    .ToList();
+
+                SlotRoomAllocationResult? allocationResult = null;
+                var usedLevel = RoomRelaxationLevel.Full;
+                var relaxationLevels = new[]
+                {
+                    RoomRelaxationLevel.StrictPreferred,
+                    RoomRelaxationLevel.PreferredBuilding,
+                    RoomRelaxationLevel.Full
+                };
+
+                foreach (var level in relaxationLevels)
+                {
+                    var stagedRequests = baseRequests.Select(CloneSlotClassRequest).ToList();
+                    if (!ApplyRoomRelaxation(level, stagedRequests, filteredRooms, classPreferences))
+                    {
+                        continue;
+                    }
+
+                    allocationResult = SolveSlotRoomAllocationWithCp(stagedRequests, filteredRooms, classPreferences, slot, config);
+                    if (allocationResult != null)
+                    {
+                        slotClassRequests = stagedRequests;
+                        usedLevel = level;
+                        break;
+                    }
+                }
+
                 if (allocationResult == null)
                 {
                     conflict = new SlotTimeConflict
@@ -853,6 +877,8 @@ namespace DTcms.Core.Common.Helpers
                     };
                     return null;
                 }
+
+                var subjectOffsets = allocationResult.SubjectStartOffsets;
 
                 foreach (var request in slotClassRequests)
                 {
@@ -869,36 +895,50 @@ namespace DTcms.Core.Common.Helpers
                         ? value
                         : allocations.First().Room.BuildingId;
 
-                    classPreferences[classId] = new ClassRoomPreference
+                    var hadPreference = classPreferences.ContainsKey(classId);
+                    if (!hadPreference || usedLevel != RoomRelaxationLevel.StrictPreferred)
                     {
-                        BuildingId = buildingId,
-                        RoomIds = allocations
-                            .OrderBy(a => a.Room.RoomNo.HasValue ? 0 : 1)
-                            .ThenBy(a => a.Room.RoomNo ?? a.Room.RoomId)
-                            .Select(a => a.Room.RoomId)
-                            .ToList()
-                    };
+                        classPreferences[classId] = new ClassRoomPreference
+                        {
+                            BuildingId = buildingId,
+                            RoomIds = allocations
+                                .OrderBy(a => a.Room.RoomNo.HasValue ? 0 : 1)
+                                .ThenBy(a => a.Room.RoomNo ?? a.Room.RoomId)
+                                .Select(a => a.Room.RoomId)
+                                .ToList()
+                        };
+                    }
 
                     var assignedStudents = 0;
 
                     foreach (var allocation in allocations)
                     {
                         var key = (slot.Index, allocation.Room.RoomId);
-                        if (!eventsLookup.TryGetValue(key, out var roomEvent))
+                        if (!eventsLookup.TryGetValue(key, out var roomEvents))
+                        {
+                            roomEvents = new List<RoomEvent>();
+                            eventsLookup[key] = roomEvents;
+                        }
+
+                        var roomEvent = roomEvents.FirstOrDefault(e => e.Subject.SubjectId == request.Subject.SubjectId);
+                        if (roomEvent == null)
                         {
                             roomEvent = new RoomEvent
                             {
                                 Room = allocation.Room,
                                 Slot = slot,
-                                Subject = request.Subject
+                                Subject = request.Subject,
+                                StartOffsetMinutes = subjectOffsets.TryGetValue(subjectId, out var offset) ? offset : 0
                             };
-                            eventsLookup[key] = roomEvent;
+                            roomEvents.Add(roomEvent);
                             container.RoomEvents.Add(roomEvent);
                         }
-                        else if (roomEvent.Subject.SubjectId != request.Subject.SubjectId)
+                        else
                         {
-                            error.AppendLine($"考场 {allocation.Room.Room.ModelRoomName ?? allocation.Room.RoomId.ToString()} 在同一场次已分配给其它科目。");
-                            return null;
+                            if (subjectOffsets.TryGetValue(subjectId, out var offset))
+                            {
+                                roomEvent.StartOffsetMinutes = offset;
+                            }
                         }
 
                         var existingShare = roomEvent.ClassShares.FirstOrDefault(s => s.Class.Class.ModelClassId == classId);
@@ -936,7 +976,8 @@ namespace DTcms.Core.Common.Helpers
                             Class = request.Class,
                             Room = allocation.Room,
                             Slot = slot,
-                            Students = allocation.Students
+                            Students = allocation.Students,
+                            StartOffsetMinutes = roomEvent.StartOffsetMinutes
                         });
 
                         assignedStudents += allocation.Students;
@@ -953,12 +994,101 @@ namespace DTcms.Core.Common.Helpers
             return container;
         }
 
-        private static SlotRoomAllocationResult? SolveSlotRoomAllocationWithCp(
-            List<SlotClassRequest> slotClasses,
+        private enum RoomRelaxationLevel
+        {
+            StrictPreferred,
+            PreferredBuilding,
+            Full
+        }
+
+        private static SlotClassRequest CloneSlotClassRequest(SlotClassRequest request)
+        {
+            return new SlotClassRequest
+            {
+                Subject = request.Subject,
+                Class = request.Class,
+                CandidateRooms = new List<int>(request.CandidateRooms),
+                PreferredRooms = new List<int>(request.PreferredRooms)
+            };
+        }
+
+        private static bool ApplyRoomRelaxation(RoomRelaxationLevel level,
+            List<SlotClassRequest> requests,
             List<RoomCandidate> roomCandidates,
             Dictionary<int, ClassRoomPreference> classPreferences)
         {
+            foreach (var request in requests)
+            {
+                var classId = request.Class.Class.ModelClassId;
+
+                switch (level)
+                {
+                    case RoomRelaxationLevel.StrictPreferred:
+                        if (classPreferences.TryGetValue(classId, out var preference))
+                        {
+                            var preferredRooms = new HashSet<int>(preference.RoomIds);
+                            var filtered = request.CandidateRooms
+                                .Where(idx => roomCandidates[idx].Room.BuildingId == preference.BuildingId && preferredRooms.Contains(roomCandidates[idx].Room.RoomId))
+                                .ToList();
+
+                            if (filtered.Count == 0)
+                            {
+                                return false;
+                            }
+
+                            request.CandidateRooms = filtered;
+                        }
+                        else if (request.PreferredRooms.Count > 0)
+                        {
+                            var preferredIndices = new HashSet<int>(request.PreferredRooms);
+                            var filtered = request.CandidateRooms.Where(preferredIndices.Contains).ToList();
+                            if (filtered.Count > 0)
+                            {
+                                request.CandidateRooms = filtered;
+                            }
+                        }
+                        break;
+
+                    case RoomRelaxationLevel.PreferredBuilding:
+                        if (classPreferences.TryGetValue(classId, out var buildingPreference))
+                        {
+                            var filtered = request.CandidateRooms
+                                .Where(idx => roomCandidates[idx].Room.BuildingId == buildingPreference.BuildingId)
+                                .ToList();
+
+                            if (filtered.Count == 0)
+                            {
+                                return false;
+                            }
+
+                            request.CandidateRooms = filtered;
+                        }
+                        break;
+                }
+
+                if (request.CandidateRooms.Count == 0)
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        private static SlotRoomAllocationResult? SolveSlotRoomAllocationWithCp(
+            List<SlotClassRequest> slotClasses,
+            List<RoomCandidate> roomCandidates,
+            Dictionary<int, ClassRoomPreference> classPreferences,
+            TimeSlotInfo slot,
+            AIExamConfig config)
+        {
             if (slotClasses.Count == 0 || roomCandidates.Count == 0)
+            {
+                return null;
+            }
+
+            var slotDuration = (int)Math.Round((slot.End - slot.Start).TotalMinutes);
+            if (slotDuration <= 0)
             {
                 return null;
             }
@@ -1078,9 +1208,35 @@ namespace DTcms.Core.Common.Helpers
                 .GroupBy(x => x.cls.Subject.SubjectId)
                 .ToDictionary(g => g.Key, g => g.Select(x => x.index).ToList());
 
+            var subjectDurations = new Dictionary<int, int>();
+            var subjectStartVars = new Dictionary<int, IntVar>();
+            var subjectEndVars = new Dictionary<int, IntVar>();
+
+            foreach (var kv in classesBySubject)
+            {
+                var subjectId = kv.Key;
+                var duration = slotClasses[kv.Value.First()].Subject.Duration > 0
+                    ? slotClasses[kv.Value.First()].Subject.Duration
+                    : slotDuration;
+
+                duration = Math.Max(1, duration);
+
+                if (duration > slotDuration)
+                {
+                    return null;
+                }
+
+                subjectDurations[subjectId] = duration;
+                var startVar = cpModel.NewIntVar(0, slotDuration - duration, $"subject_{subjectId}_start");
+                var endVar = cpModel.NewIntVar(duration, slotDuration, $"subject_{subjectId}_end");
+                cpModel.Add(endVar == startVar + duration);
+                subjectStartVars[subjectId] = startVar;
+                subjectEndVars[subjectId] = endVar;
+            }
+
             for (var j = 0; j < roomCount; j++)
             {
-                var subjectVars = new List<BoolVar>();
+                var subjectVars = new List<(int subjectId, BoolVar variable)>();
                 foreach (var kv in classesBySubject)
                 {
                     var relevantIndexes = kv.Value.Where(idx => yVars[idx, j] is not null).ToList();
@@ -1096,12 +1252,48 @@ namespace DTcms.Core.Common.Helpers
                     }
 
                     cpModel.Add(subjectVar <= LinearExpr.Sum(relevantIndexes.Select(idx => yVars[idx, j]!).ToArray()));
-                    subjectVars.Add(subjectVar);
+                    subjectVars.Add((kv.Key, subjectVar));
                 }
 
-                if (subjectVars.Count > 0)
+                if (subjectVars.Count == 0)
                 {
-                    cpModel.Add(LinearExpr.Sum(subjectVars.ToArray()) <= 1);
+                    continue;
+                }
+
+                var intervals = new List<IntervalVar>();
+                foreach (var (subjectId, variable) in subjectVars)
+                {
+                    var duration = subjectDurations[subjectId];
+                    var startVar = subjectStartVars[subjectId];
+                    var endVar = subjectEndVars[subjectId];
+                    intervals.Add(cpModel.NewOptionalIntervalVar(startVar, duration, endVar, variable));
+                }
+
+                cpModel.AddNoOverlap(intervals);
+
+                if (config.MinExamInterval > 0 && subjectVars.Count > 1)
+                {
+                    for (var a = 0; a < subjectVars.Count; a++)
+                    {
+                        for (var b = a + 1; b < subjectVars.Count; b++)
+                        {
+                            var subjectA = subjectVars[a];
+                            var subjectB = subjectVars[b];
+
+                            var orderAB = cpModel.NewBoolVar($"room_{roomCandidates[j].Room.RoomId}_order_{subjectA.subjectId}_{subjectB.subjectId}_ab");
+                            var orderBA = cpModel.NewBoolVar($"room_{roomCandidates[j].Room.RoomId}_order_{subjectB.subjectId}_{subjectA.subjectId}_ba");
+
+                            cpModel.Add(orderAB <= subjectA.variable);
+                            cpModel.Add(orderAB <= subjectB.variable);
+                            cpModel.Add(orderBA <= subjectA.variable);
+                            cpModel.Add(orderBA <= subjectB.variable);
+                            cpModel.Add(orderAB + orderBA >= subjectA.variable + subjectB.variable - 1);
+                            cpModel.Add(orderAB + orderBA <= 1);
+
+                            cpModel.Add(subjectEndVars[subjectA.subjectId] + config.MinExamInterval <= subjectStartVars[subjectB.subjectId]).OnlyEnforceIf(orderAB);
+                            cpModel.Add(subjectEndVars[subjectB.subjectId] + config.MinExamInterval <= subjectStartVars[subjectA.subjectId]).OnlyEnforceIf(orderBA);
+                        }
+                    }
                 }
             }
 
@@ -1298,8 +1490,7 @@ namespace DTcms.Core.Common.Helpers
                     allocations.Add(new RoomAllocation
                     {
                         Room = roomCandidates[roomIndex].Room,
-                        Students = assigned,
-                        ExistingEvent = roomCandidates[roomIndex].ExistingEvent
+                        Students = assigned
                     });
                 }
 
@@ -1321,6 +1512,11 @@ namespace DTcms.Core.Common.Helpers
                         }
                     }
                 }
+            }
+
+            foreach (var kv in subjectStartVars)
+            {
+                result.SubjectStartOffsets[kv.Key] = (int)solver.Value(kv.Value);
             }
 
             return result;
@@ -1352,16 +1548,16 @@ namespace DTcms.Core.Common.Helpers
 
         #region 教师分配
 
-        private static Dictionary<(int timeIndex, int roomId), List<int>>? AssignTeachers(
+        private static Dictionary<(int timeIndex, int roomId, int subjectId), List<int>>? AssignTeachers(
             List<TeacherInfo> teachers,
             List<RoomEvent> roomEvents,
             AIExamModel model,
             StringBuilder error)
         {
-            var result = new Dictionary<(int timeIndex, int roomId), List<int>>();
+            var result = new Dictionary<(int timeIndex, int roomId, int subjectId), List<int>>();
             foreach (var evt in roomEvents)
             {
-                result[(evt.Slot.Index, evt.Room.RoomId)] = new List<int>();
+                result[(evt.Slot.Index, evt.Room.RoomId, evt.Subject.SubjectId)] = new List<int>();
             }
 
             var eventsRequiringTeacher = roomEvents.Where(e => e.TotalStudents > 0 && e.Room.TeacherCount > 0).ToList();
@@ -1463,7 +1659,6 @@ namespace DTcms.Core.Common.Helpers
                 }
 
                 var dayRoomEvents = new Dictionary<DateOnly, Dictionary<int, List<BoolVar>>>();
-                var maxOnePerSlot = new Dictionary<int, List<BoolVar>>();
                 foreach (var (evt, index) in eventsByIndex)
                 {
                     if (!assignmentVars.TryGetValue((teacher.TeacherId, index), out var variable))
@@ -1486,13 +1681,6 @@ namespace DTcms.Core.Common.Helpers
 
                     eventList.Add(variable);
 
-                    if (!maxOnePerSlot.TryGetValue(evt.Slot.Index, out var slotList))
-                    {
-                        slotList = new List<BoolVar>();
-                        maxOnePerSlot[evt.Slot.Index] = slotList;
-                    }
-
-                    slotList.Add(variable);
                 }
 
                 var dayRoomSelectionVars = new Dictionary<DateOnly, List<BoolVar>>();
@@ -1521,11 +1709,6 @@ namespace DTcms.Core.Common.Helpers
                 }
 
                 foreach (var kv in dayRoomSelectionVars)
-                {
-                    cpModel.Add(LinearExpr.Sum(kv.Value) <= 1);
-                }
-
-                foreach (var kv in maxOnePerSlot)
                 {
                     cpModel.Add(LinearExpr.Sum(kv.Value) <= 1);
                 }
@@ -1603,7 +1786,7 @@ namespace DTcms.Core.Common.Helpers
                     }
                 }
 
-                result[(evt.Slot.Index, evt.Room.RoomId)] = teachersForEvent;
+                result[(evt.Slot.Index, evt.Room.RoomId, evt.Subject.SubjectId)] = teachersForEvent;
             }
 
             return result;
@@ -1740,14 +1923,14 @@ namespace DTcms.Core.Common.Helpers
         #endregion
 
         private static List<AIExamResult> BuildResults(RoomAssignmentContainer container,
-            Dictionary<(int timeIndex, int roomId), List<int>> teacherAssignments)
+            Dictionary<(int timeIndex, int roomId, int subjectId), List<int>> teacherAssignments)
         {
             var results = new List<AIExamResult>();
 
             foreach (var assignment in container.ClassAssignments)
             {
                 var timeIndex = assignment.Slot.Index;
-                var start = assignment.Slot.Start;
+                var start = assignment.Slot.Start.AddMinutes(assignment.StartOffsetMinutes);
                 var duration = assignment.Subject.Duration > 0 ? assignment.Subject.Duration : (int)(assignment.Slot.End - assignment.Slot.Start).TotalMinutes;
                 var end = start.AddMinutes(duration);
                 if (end > assignment.Slot.End)
@@ -1755,7 +1938,7 @@ namespace DTcms.Core.Common.Helpers
                     end = assignment.Slot.End;
                 }
 
-                var teacherList = teacherAssignments.TryGetValue((timeIndex, assignment.Room.RoomId), out var assignedTeachers)
+                var teacherList = teacherAssignments.TryGetValue((timeIndex, assignment.Room.RoomId, assignment.Subject.SubjectId), out var assignedTeachers)
                     ? assignedTeachers
                     : new List<int>();
 
@@ -1839,6 +2022,7 @@ namespace DTcms.Core.Common.Helpers
             public RoomInfo Room { get; set; } = null!;
             public TimeSlotInfo Slot { get; set; } = null!;
             public int Students { get; set; }
+            public int StartOffsetMinutes { get; set; }
         }
 
         private sealed class ClassRoomShare
@@ -1854,7 +2038,8 @@ namespace DTcms.Core.Common.Helpers
             public SubjectInfo Subject { get; set; } = null!;
             public List<ClassRoomShare> ClassShares { get; } = new List<ClassRoomShare>();
             public int TotalStudents { get; set; }
-            public DateTime StartTime => Slot.Start;
+            public int StartOffsetMinutes { get; set; }
+            public DateTime StartTime => Slot.Start.AddMinutes(StartOffsetMinutes);
             public DateTime EndTime
             {
                 get
@@ -1862,7 +2047,7 @@ namespace DTcms.Core.Common.Helpers
                     var duration = Subject.Duration > 0
                         ? Subject.Duration
                         : (int)(Slot.End - Slot.Start).TotalMinutes;
-                    var end = Slot.Start.AddMinutes(duration);
+                    var end = StartTime.AddMinutes(duration);
                     return end <= Slot.End ? end : Slot.End;
                 }
             }
@@ -1871,15 +2056,13 @@ namespace DTcms.Core.Common.Helpers
         private sealed class RoomCandidate
         {
             public RoomInfo Room { get; set; } = null!;
-            public RoomEvent? ExistingEvent { get; set; }
-            public int AvailableSeats => Math.Max(0, Room.SeatCount - (ExistingEvent?.TotalStudents ?? 0));
+            public int AvailableSeats => Room.SeatCount;
         }
 
         private sealed class RoomAllocation
         {
             public RoomInfo Room { get; set; } = null!;
             public int Students { get; set; }
-            public RoomEvent? ExistingEvent { get; set; }
         }
 
         private sealed class SlotClassRequest
@@ -1894,6 +2077,7 @@ namespace DTcms.Core.Common.Helpers
         {
             public Dictionary<(int subjectId, int classId), List<RoomAllocation>> ClassAllocations { get; } = new Dictionary<(int subjectId, int classId), List<RoomAllocation>>();
             public Dictionary<int, int> ClassBuilding { get; } = new Dictionary<int, int>();
+            public Dictionary<int, int> SubjectStartOffsets { get; } = new Dictionary<int, int>();
         }
 
         private sealed class ClassRoomPreference
@@ -1906,7 +2090,7 @@ namespace DTcms.Core.Common.Helpers
         {
             public List<ClassRoomAssignment> ClassAssignments { get; } = new List<ClassRoomAssignment>();
             public List<RoomEvent> RoomEvents { get; } = new List<RoomEvent>();
-            public Dictionary<(int timeIndex, int roomId), RoomEvent> EventLookup { get; set; } = new Dictionary<(int timeIndex, int roomId), RoomEvent>();
+            public Dictionary<(int timeIndex, int roomId), List<RoomEvent>> EventLookup { get; set; } = new Dictionary<(int timeIndex, int roomId), List<RoomEvent>>();
         }
 
         private sealed class SlotTimeConflict
