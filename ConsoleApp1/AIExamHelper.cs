@@ -1334,41 +1334,6 @@ namespace DTcms.Core.Common.Helpers
                 }
             }
 
-            var classesByGrade = slotClasses
-                .Select((cls, index) => new { cls, index })
-                .GroupBy(x => x.cls.Class.Grade)
-                .ToDictionary(g => g.Key, g => g.Select(x => x.index).ToList());
-
-            for (var j = 0; j < roomCount; j++)
-            {
-                var gradeVars = new List<BoolVar>();
-                foreach (var kv in classesByGrade)
-                {
-                    var relevantIndexes = kv.Value.Where(idx => yVars[idx, j] is not null).ToList();
-                    if (relevantIndexes.Count == 0)
-                    {
-                        continue;
-                    }
-
-                    var gradeVar = cpModel.NewBoolVar($"room_{roomCandidates[j].Room.RoomId}_grade_{kv.Key}");
-                    foreach (var idx in relevantIndexes)
-                    {
-                        cpModel.Add(yVars[idx, j]! <= gradeVar);
-                    }
-
-                    var gradeUsage = LinearExpr.Sum(relevantIndexes.Select(idx => yVars[idx, j]!).ToArray());
-                    cpModel.Add(gradeVar <= gradeUsage);
-                    cpModel.Add(gradeUsage <= 1);
-
-                    gradeVars.Add(gradeVar);
-                }
-
-                if (gradeVars.Count > 0)
-                {
-                    cpModel.Add(LinearExpr.Sum(gradeVars.ToArray()) <= 2);
-                }
-            }
-
             var classesBySubject = slotClasses
                 .Select((cls, index) => new { cls, index })
                 .GroupBy(x => x.cls.Subject.SubjectId)
@@ -1402,6 +1367,30 @@ namespace DTcms.Core.Common.Helpers
                     if (relevantIndexes.Count == 0)
                     {
                         continue;
+                    }
+
+                    var gradeIndicators = new List<BoolVar>();
+                    foreach (var gradeGroup in relevantIndexes
+                        .GroupBy(idx => slotClasses[idx].Class.Grade))
+                    {
+                        var gradeIndex = gradeGroup.First();
+                        var gradeValue = slotClasses[gradeIndex].Class.Grade;
+                        var gradeVar = cpModel.NewBoolVar($"room_{roomCandidates[j].Room.RoomId}_subject_{kv.Key}_grade_{gradeValue}");
+
+                        foreach (var idx in gradeGroup)
+                        {
+                            cpModel.Add(yVars[idx, j]! <= gradeVar);
+                        }
+
+                        var usageExpr = LinearExpr.Sum(gradeGroup.Select(idx => yVars[idx, j]!).ToArray());
+                        cpModel.Add(gradeVar <= usageExpr);
+                        cpModel.Add(usageExpr <= 1);
+                        gradeIndicators.Add(gradeVar);
+                    }
+
+                    if (gradeIndicators.Count > 0)
+                    {
+                        cpModel.Add(LinearExpr.Sum(gradeIndicators.ToArray()) <= 2);
                     }
 
                     var subjectVar = cpModel.NewBoolVar($"room_{roomCandidates[j].Room.RoomId}_subject_{kv.Key}");
