@@ -977,6 +977,23 @@ namespace DTcms.Core.Common.Helpers
                     return null;
                 }
 
+                if (!ValidateRoomSchedules(slotSubjects, allocationResult, slot, subjectOffsets, config, out var scheduleConflict))
+                {
+                    var subjectIdSet = new HashSet<int>(slotSubjects.Select(s => s.SubjectId));
+                    conflict = scheduleConflict ?? new SlotTimeConflict
+                    {
+                        TimeIndex = timeIndex,
+                        SubjectIds = subjectIdSet.ToList(),
+                        ClassIds = allocationResult.ClassAllocations
+                            .Where(kvp => subjectIdSet.Contains(kvp.Key.subjectId))
+                            .Select(kvp => kvp.Key.classId)
+                            .Distinct()
+                            .ToList()
+                    };
+
+                    return null;
+                }
+
                 foreach (var request in slotClassRequests)
                 {
                     var classId = request.Class.Class.ModelClassId;
@@ -1527,6 +1544,131 @@ namespace DTcms.Core.Common.Helpers
             }
 
             return offsets;
+        }
+
+        private static bool ValidateRoomSchedules(
+            List<SubjectInfo> slotSubjects,
+            SlotRoomAllocationResult allocationResult,
+            TimeSlotInfo slot,
+            Dictionary<int, int> subjectOffsets,
+            AIExamConfig config,
+            out SlotTimeConflict? conflict)
+        {
+            conflict = null;
+
+            if (slotSubjects.Count == 0 || allocationResult.ClassAllocations.Count == 0)
+            {
+                return true;
+            }
+
+            var subjectLookup = slotSubjects.ToDictionary(s => s.SubjectId, s => s);
+            var roomSchedules = new Dictionary<int, List<(SubjectInfo Subject, int StartOffset, int Duration)>>();
+
+            foreach (var kvp in allocationResult.ClassAllocations)
+            {
+                if (!subjectLookup.TryGetValue(kvp.Key.subjectId, out var subject))
+                {
+                    continue;
+                }
+
+                foreach (var allocation in kvp.Value)
+                {
+                    if (!roomSchedules.TryGetValue(allocation.Room.RoomId, out var list))
+                    {
+                        list = new List<(SubjectInfo Subject, int StartOffset, int Duration)>();
+                        roomSchedules[allocation.Room.RoomId] = list;
+                    }
+
+                    if (list.Any(entry => entry.Subject.SubjectId == subject.SubjectId))
+                    {
+                        continue;
+                    }
+
+                    var duration = GetSubjectDurationForSlot(subject, slot);
+                    if (duration <= 0)
+                    {
+                        conflict = new SlotTimeConflict
+                        {
+                            TimeIndex = slot.Index,
+                            SubjectIds = new List<int> { subject.SubjectId },
+                            ClassIds = new List<int> { kvp.Key.classId }
+                        };
+                        return false;
+                    }
+
+                    var startOffset = subjectOffsets.TryGetValue(subject.SubjectId, out var offset)
+                        ? offset
+                        : 0;
+
+                    list.Add((subject, startOffset, duration));
+                }
+            }
+
+            var minGap = Math.Max(0, config.MinExamInterval);
+            foreach (var kvp in roomSchedules)
+            {
+                var entries = kvp.Value;
+                if (entries.Count <= 1)
+                {
+                    continue;
+                }
+
+                var ordered = entries
+                    .OrderBy(entry => entry.StartOffset)
+                    .ThenByDescending(entry => entry.Duration)
+                    .ToList();
+
+                for (var i = 1; i < ordered.Count; i++)
+                {
+                    var previous = ordered[i - 1];
+                    var current = ordered[i];
+
+                    var previousStart = slot.Start.AddMinutes(previous.StartOffset);
+                    var previousEnd = previousStart.AddMinutes(previous.Duration);
+                    if (previousEnd > slot.End)
+                    {
+                        previousEnd = slot.End;
+                    }
+
+                    var currentStart = slot.Start.AddMinutes(current.StartOffset);
+                    var currentEnd = currentStart.AddMinutes(current.Duration);
+                    if (currentEnd > slot.End)
+                    {
+                        currentEnd = slot.End;
+                    }
+
+                    if (!HasSufficientGap(previousStart, previousEnd, currentStart, currentEnd, minGap))
+                    {
+                        conflict = new SlotTimeConflict
+                        {
+                            TimeIndex = slot.Index,
+                            SubjectIds = new List<int>
+                                {
+                                    previous.Subject.SubjectId,
+                                    current.Subject.SubjectId
+                                }
+                                .Distinct()
+                                .ToList(),
+                            ClassIds = CollectClassIdsForSubjects(allocationResult, previous.Subject.SubjectId, current.Subject.SubjectId)
+                        };
+                        return false;
+                    }
+                }
+            }
+
+            return true;
+        }
+
+        private static List<int> CollectClassIdsForSubjects(
+            SlotRoomAllocationResult allocationResult,
+            params int[] subjectIds)
+        {
+            var subjectSet = new HashSet<int>(subjectIds);
+            return allocationResult.ClassAllocations
+                .Where(kvp => subjectSet.Contains(kvp.Key.subjectId))
+                .Select(kvp => kvp.Key.classId)
+                .Distinct()
+                .ToList();
         }
 
         private static bool HasSufficientGap(DateTime startA, DateTime endA, DateTime startB, DateTime endB, int minGapMinutes)
