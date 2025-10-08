@@ -67,15 +67,69 @@ namespace DTcms.Core.Common.Helpers
                 return new List<AIExamResult>();
             }
 
-            var subjectTimeAssignments = SolveSubjectTimeAllocation(config, subjects, timeSlots, model, error);
-            if (subjectTimeAssignments == null)
+            var conflictCuts = new List<SlotTimeConflict>();
+            RoomAssignmentContainer? roomAssignments = null;
+            Dictionary<int, int>? subjectTimeAssignments = null;
+            SlotTimeConflict? lastConflict = null;
+
+            var maxIterations = (int)Math.Min(int.MaxValue, Math.Max(1L, (long)Math.Max(1, subjects.Count) * Math.Max(1, timeSlots.Count)));
+            var attempt = 0;
+
+            while (attempt < maxIterations)
             {
-                throw new ResponseException(error.ToString(), ErrorCode.ParamError);
+                attempt++;
+                var errorLengthBeforeSolve = error.Length;
+
+                subjectTimeAssignments = SolveSubjectTimeAllocation(config, subjects, timeSlots, model, conflictCuts, error);
+                if (subjectTimeAssignments == null)
+                {
+                    throw new ResponseException(error.ToString(), ErrorCode.ParamError);
+                }
+
+                roomAssignments = AllocateRooms(subjects, rooms, timeSlots, subjectTimeAssignments, model, out var conflict, error);
+                if (roomAssignments != null)
+                {
+                    break;
+                }
+
+                if (conflict == null)
+                {
+                    throw new ResponseException(error.ToString(), ErrorCode.ParamError);
+                }
+
+                error.Length = errorLengthBeforeSolve;
+
+                lastConflict = conflict;
+
+                if (!conflictCuts.Any(existing => existing.TimeIndex == conflict.TimeIndex &&
+                    existing.SubjectIds.Count == conflict.SubjectIds.Count &&
+                    !existing.SubjectIds.Except(conflict.SubjectIds).Any()))
+                {
+                    conflictCuts.Add(conflict);
+                }
+
+                if (attempt >= maxIterations)
+                {
+                    break;
+                }
             }
 
-            var roomAssignments = AllocateRooms(subjects, rooms, timeSlots, subjectTimeAssignments, model, error);
-            if (roomAssignments == null)
+            if (roomAssignments == null || subjectTimeAssignments == null)
             {
+                if (lastConflict != null)
+                {
+                    var slot = timeSlots[lastConflict.TimeIndex];
+                    var subjectNames = subjects
+                        .Where(s => lastConflict.SubjectIds.Contains(s.SubjectId))
+                        .Select(s => s.Subject.ModelSubjectName ?? s.SubjectId.ToString())
+                        .ToList();
+                    if (subjectNames.Count > 0)
+                    {
+                        error.AppendLine($"多次调整后仍无法在场次 {slot.Date} {slot.Start:HH:mm} 安排科目 {string.Join("、", subjectNames)} 的考场，请检查容量或规则设置。");
+                    }
+                }
+
+                error.AppendLine("多次调整考试时间后仍无法满足考场约束，请检查排考数据是否存在冲突。");
                 throw new ResponseException(error.ToString(), ErrorCode.ParamError);
             }
 
@@ -292,6 +346,7 @@ namespace DTcms.Core.Common.Helpers
             List<SubjectInfo> subjects,
             List<TimeSlotInfo> timeSlots,
             AIExamModel model,
+            List<SlotTimeConflict> conflictCuts,
             StringBuilder error)
         {
             var cpModel = new CpModel();
@@ -320,6 +375,42 @@ namespace DTcms.Core.Common.Helpers
             ApplyJointSubjectNotConstraints(model, cpModel, subjectTimeVars);
             ApplyClassDailyLimitConstraint(config, subjects, timeSlots, cpModel, subjectTimeVars);
             ApplyMinIntervalConstraint(config, subjects, timeSlots, cpModel, subjectTimeVars);
+
+            foreach (var conflict in conflictCuts)
+            {
+                if (conflict.SubjectIds.Count == 0)
+                {
+                    continue;
+                }
+
+                var varsInConflict = new List<BoolVar>();
+                foreach (var subjectId in conflict.SubjectIds)
+                {
+                    if (!subjectCandidates.TryGetValue(subjectId, out var timeList) || !timeList.Contains(conflict.TimeIndex))
+                    {
+                        continue;
+                    }
+
+                    if (subjectTimeVars.TryGetValue((subjectId, conflict.TimeIndex), out var variable))
+                    {
+                        varsInConflict.Add(variable);
+                    }
+                }
+
+                if (varsInConflict.Count == 0)
+                {
+                    continue;
+                }
+
+                if (varsInConflict.Count == 1)
+                {
+                    cpModel.Add(varsInConflict[0] == 0);
+                }
+                else
+                {
+                    cpModel.Add(LinearExpr.Sum(varsInConflict) <= varsInConflict.Count - 1);
+                }
+            }
 
             var solver = new CpSolver
             {
@@ -559,8 +650,10 @@ namespace DTcms.Core.Common.Helpers
             List<TimeSlotInfo> timeSlots,
             Dictionary<int, int> subjectTimeAssignments,
             AIExamModel model,
+            out SlotTimeConflict? conflict,
             StringBuilder error)
         {
+            conflict = null;
             var roomSubjectAllow = BuildSubjectRoomRule(model.RuleRoomSubjectList);
             var roomSubjectBlock = BuildSubjectRoomRule(model.RuleRoomSubjectNotList);
 
@@ -707,17 +800,11 @@ namespace DTcms.Core.Common.Helpers
                 var allocationResult = SolveSlotRoomAllocationWithCp(slotClassRequests, filteredRooms, classPreferences);
                 if (allocationResult == null)
                 {
-                    if (slotSubjects.Count == 1)
+                    conflict = new SlotTimeConflict
                     {
-                        var subject = slotSubjects[0];
-                        error.AppendLine($"无法为科目 {subject.Subject.ModelSubjectName ?? subject.SubjectId.ToString()} 的班级整体分配可行的考场方案。");
-                    }
-                    else
-                    {
-                        var subjectNames = string.Join("、", slotSubjects.Select(s => s.Subject.ModelSubjectName ?? s.SubjectId.ToString()));
-                        error.AppendLine($"无法在场次 {slot.Date} {slot.Start:HH:mm} 为科目 {subjectNames} 的班级整体分配可行的考场方案。");
-                    }
-
+                        TimeIndex = timeIndex,
+                        SubjectIds = slotSubjects.Select(s => s.Subject.SubjectId).Distinct().ToList()
+                    };
                     return null;
                 }
 
@@ -1742,6 +1829,12 @@ namespace DTcms.Core.Common.Helpers
             public List<ClassRoomAssignment> ClassAssignments { get; } = new List<ClassRoomAssignment>();
             public List<RoomEvent> RoomEvents { get; } = new List<RoomEvent>();
             public Dictionary<(int timeIndex, int roomId), RoomEvent> EventLookup { get; set; } = new Dictionary<(int timeIndex, int roomId), RoomEvent>();
+        }
+
+        private sealed class SlotTimeConflict
+        {
+            public int TimeIndex { get; set; }
+            public List<int> SubjectIds { get; set; } = new List<int>();
         }
 
         #endregion
