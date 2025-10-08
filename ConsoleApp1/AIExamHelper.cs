@@ -723,7 +723,6 @@ namespace DTcms.Core.Common.Helpers
 
                 var slotClassRequests = new List<SlotClassRequest>();
                 var usedRoomIndices = new HashSet<int>();
-                var classesNeedingPreferenceReset = new HashSet<int>();
 
                 foreach (var subject in slotSubjects)
                 {
@@ -782,7 +781,6 @@ namespace DTcms.Core.Common.Helpers
                             return null;
                         }
 
-                        var finalCandidates = candidateIndices;
                         var classId = cls.Class.ModelClassId;
 
                         if (classPreferences.TryGetValue(classId, out var preference))
@@ -790,27 +788,18 @@ namespace DTcms.Core.Common.Helpers
                             var preferredRoomSet = preference.RoomIds.ToHashSet();
                             var preferredCandidates = candidateIndices
                                 .Where(idx => slotRooms[idx].Room.BuildingId == preference.BuildingId && preferredRoomSet.Contains(slotRooms[idx].Room.RoomId))
+                                .OrderBy(idx => preference.RoomIds.IndexOf(slotRooms[idx].Room.RoomId))
                                 .ToList();
 
-                            var preferredSeatCount = preferredCandidates.Sum(idx => slotRooms[idx].AvailableSeats);
-
-                            if (preferredCandidates.Count == preference.RoomIds.Count &&
-                                preference.RoomIds.All(id => preferredCandidates.Any(idx => slotRooms[idx].Room.RoomId == id)) &&
-                                preferredSeatCount >= cls.StudentCount)
+                            if (preferredCandidates.Count > 0)
                             {
-                                finalCandidates = preferredCandidates
-                                    .OrderBy(idx => preference.RoomIds.IndexOf(slotRooms[idx].Room.RoomId))
-                                    .ToList();
-                            }
-                            else
-                            {
-                                classesNeedingPreferenceReset.Add(classId);
+                                request.PreferredRooms = preferredCandidates;
                             }
                         }
 
-                        request.CandidateRooms = finalCandidates;
+                        request.CandidateRooms = candidateIndices;
 
-                        foreach (var idx in finalCandidates)
+                        foreach (var idx in candidateIndices)
                         {
                             usedRoomIndices.Add(idx);
                         }
@@ -823,11 +812,6 @@ namespace DTcms.Core.Common.Helpers
                 {
                     error.AppendLine($"场次 {slot.Date} {slot.Start:HH:mm} 没有满足条件的考场可用。");
                     return null;
-                }
-
-                foreach (var classId in classesNeedingPreferenceReset)
-                {
-                    classPreferences.Remove(classId);
                 }
 
                 var indexMap = new Dictionary<int, int>();
@@ -848,6 +832,14 @@ namespace DTcms.Core.Common.Helpers
                     for (var i = 0; i < request.CandidateRooms.Count; i++)
                     {
                         request.CandidateRooms[i] = indexMap[request.CandidateRooms[i]];
+                    }
+
+                    if (request.PreferredRooms.Count > 0)
+                    {
+                        for (var i = 0; i < request.PreferredRooms.Count; i++)
+                        {
+                            request.PreferredRooms[i] = indexMap[request.PreferredRooms[i]];
+                        }
                     }
                 }
 
@@ -1163,6 +1155,37 @@ namespace DTcms.Core.Common.Helpers
                     var changePreferred = cpModel.NewBoolVar($"cls_{slotClasses[i].Class.Class.ModelClassId}_change_pref_building");
                     cpModel.Add(changePreferred + keepPreferred == 1);
                     preferencePenaltyVars.Add(changePreferred);
+                }
+
+                if (slotClasses[i].PreferredRooms.Count > 0)
+                {
+                    var preferredSet = new HashSet<int>(slotClasses[i].PreferredRooms);
+                    var nonPreferredVars = new List<BoolVar>();
+
+                    for (var j = 0; j < roomCount; j++)
+                    {
+                        if (yVars[i, j] is null)
+                        {
+                            continue;
+                        }
+
+                        if (!preferredSet.Contains(j))
+                        {
+                            nonPreferredVars.Add(yVars[i, j]!);
+                        }
+                    }
+
+                    if (nonPreferredVars.Count > 0)
+                    {
+                        var leavePreferred = cpModel.NewBoolVar($"cls_{slotClasses[i].Class.Class.ModelClassId}_leave_pref_rooms");
+                        foreach (var indicator in nonPreferredVars)
+                        {
+                            cpModel.Add(indicator <= leavePreferred);
+                        }
+
+                        cpModel.Add(leavePreferred <= LinearExpr.Sum(nonPreferredVars.ToArray()));
+                        preferencePenaltyVars.Add(leavePreferred);
+                    }
                 }
             }
 
@@ -1864,6 +1887,7 @@ namespace DTcms.Core.Common.Helpers
             public SubjectInfo Subject { get; set; } = null!;
             public ClassInfo Class { get; set; } = null!;
             public List<int> CandidateRooms { get; set; } = new List<int>();
+            public List<int> PreferredRooms { get; set; } = new List<int>();
         }
 
         private sealed class SlotRoomAllocationResult
