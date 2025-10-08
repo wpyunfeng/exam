@@ -68,11 +68,12 @@ namespace DTcms.Core.Common.Helpers
             }
 
             var conflictCuts = new List<SlotTimeConflict>();
+            var conflictCutKeys = new HashSet<string>();
             RoomAssignmentContainer? roomAssignments = null;
             Dictionary<int, int>? subjectTimeAssignments = null;
             SlotTimeConflict? lastConflict = null;
 
-            var maxIterations = (int)Math.Min(int.MaxValue, Math.Max(1L, (long)Math.Max(1, subjects.Count) * Math.Max(1, timeSlots.Count)));
+            var maxIterations = (int)Math.Max(1, Math.Min(50L, Math.Max(1L, (long)Math.Max(1, subjects.Count) * Math.Max(1, timeSlots.Count))));
             var attempt = 0;
 
             while (attempt < maxIterations)
@@ -94,21 +95,14 @@ namespace DTcms.Core.Common.Helpers
 
                 if (conflict == null)
                 {
-                    throw new ResponseException(error.ToString(), ErrorCode.ParamError);
+                    break;
                 }
 
                 error.Length = errorLengthBeforeSolve;
 
                 lastConflict = conflict;
 
-                if (!conflictCuts.Any(existing => existing.TimeIndex == conflict.TimeIndex &&
-                    existing.SubjectIds.Count == conflict.SubjectIds.Count &&
-                    !existing.SubjectIds.Except(conflict.SubjectIds).Any()))
-                {
-                    conflictCuts.Add(conflict);
-                }
-
-                if (attempt >= maxIterations)
+                if (!TryAddConflictCut(conflictCuts, conflictCutKeys, conflict))
                 {
                     break;
                 }
@@ -141,6 +135,26 @@ namespace DTcms.Core.Common.Helpers
 
             return BuildResults(roomAssignments, teacherAssignments);
 
+        }
+
+        private static bool TryAddConflictCut(List<SlotTimeConflict> conflictCuts, HashSet<string> conflictCutKeys, SlotTimeConflict conflict)
+        {
+            var key = BuildConflictCutKey(conflict);
+            if (!conflictCutKeys.Add(key))
+            {
+                return false;
+            }
+
+            conflictCuts.Add(conflict);
+            return true;
+        }
+
+        private static string BuildConflictCutKey(SlotTimeConflict conflict)
+        {
+            var orderedSubjects = conflict.SubjectIds != null && conflict.SubjectIds.Count > 0
+                ? conflict.SubjectIds.OrderBy(id => id)
+                : Enumerable.Empty<int>();
+            return $"{conflict.TimeIndex}:{string.Join(',', orderedSubjects)}";
         }
 
         #region 构建基础数据
