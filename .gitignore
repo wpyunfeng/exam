@@ -11,8 +11,7 @@
 *.userprefs
 
 # Build results 
-.vs/
-DTcms.Core8.0/old-flow/
+.vs/ 
 ConsoleApp1/[Bb]in/
 ConsoleApp1/[Oo]bj/  
 
