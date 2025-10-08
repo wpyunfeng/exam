@@ -72,6 +72,7 @@ namespace DTcms.Core.Common.Helpers
             RoomAssignmentContainer? roomAssignments = null;
             Dictionary<int, int>? subjectTimeAssignments = null;
             SlotTimeConflict? lastConflict = null;
+            var persistentClassPreferences = new Dictionary<int, ClassRoomPreference>();
 
             var maxIterations = (int)Math.Max(1, Math.Min(50L, Math.Max(1L, (long)Math.Max(1, subjects.Count) * Math.Max(1, timeSlots.Count))));
             var attempt = 0;
@@ -87,7 +88,7 @@ namespace DTcms.Core.Common.Helpers
                     throw new ResponseException(error.ToString(), ErrorCode.ParamError);
                 }
 
-                roomAssignments = AllocateRooms(subjects, rooms, timeSlots, subjectTimeAssignments, model, config, out var conflict, error);
+                roomAssignments = AllocateRooms(subjects, rooms, timeSlots, subjectTimeAssignments, model, config, persistentClassPreferences, out var conflict, error);
                 if (roomAssignments != null)
                 {
                     break;
@@ -99,6 +100,23 @@ namespace DTcms.Core.Common.Helpers
                 }
 
                 error.Length = errorLengthBeforeSolve;
+
+                var removedPreference = false;
+                if (conflict.ClassIds != null && conflict.ClassIds.Count > 0)
+                {
+                    foreach (var classId in conflict.ClassIds)
+                    {
+                        if (persistentClassPreferences.Remove(classId))
+                        {
+                            removedPreference = true;
+                        }
+                    }
+                }
+
+                if (removedPreference)
+                {
+                    continue;
+                }
 
                 lastConflict = conflict;
 
@@ -665,6 +683,7 @@ namespace DTcms.Core.Common.Helpers
             Dictionary<int, int> subjectTimeAssignments,
             AIExamModel model,
             AIExamConfig config,
+            Dictionary<int, ClassRoomPreference> persistentClassPreferences,
             out SlotTimeConflict? conflict,
             StringBuilder error)
         {
@@ -675,7 +694,8 @@ namespace DTcms.Core.Common.Helpers
             var container = new RoomAssignmentContainer();
             var eventsLookup = new Dictionary<(int timeIndex, int roomId), List<RoomEvent>>();
             container.EventLookup = eventsLookup;
-            var classPreferences = new Dictionary<int, ClassRoomPreference>();
+            var classPreferences = persistentClassPreferences
+                .ToDictionary(kvp => kvp.Key, kvp => ClonePreference(kvp.Value));
 
             var subjectWithTime = subjects
                 .Where(s => subjectTimeAssignments.ContainsKey(s.SubjectId))
@@ -868,7 +888,8 @@ namespace DTcms.Core.Common.Helpers
                     conflict = new SlotTimeConflict
                     {
                         TimeIndex = timeIndex,
-                        SubjectIds = slotSubjects.Select(s => s.Subject.ModelSubjectId).Distinct().ToList()
+                        SubjectIds = slotSubjects.Select(s => s.Subject.ModelSubjectId).Distinct().ToList(),
+                        ClassIds = slotClassRequests.Select(r => r.Class.Class.ModelClassId).Distinct().ToList()
                     };
                     return null;
                 }
@@ -986,6 +1007,12 @@ namespace DTcms.Core.Common.Helpers
                 }
             }
 
+            persistentClassPreferences.Clear();
+            foreach (var kvp in classPreferences)
+            {
+                persistentClassPreferences[kvp.Key] = ClonePreference(kvp.Value);
+            }
+
             return container;
         }
 
@@ -1004,6 +1031,17 @@ namespace DTcms.Core.Common.Helpers
                 Class = request.Class,
                 CandidateRooms = new List<int>(request.CandidateRooms),
                 PreferredRooms = new List<int>(request.PreferredRooms)
+            };
+        }
+
+        private static ClassRoomPreference ClonePreference(ClassRoomPreference preference)
+        {
+            return new ClassRoomPreference
+            {
+                BuildingId = preference.BuildingId,
+                RoomIds = preference.RoomIds != null
+                    ? new List<int>(preference.RoomIds)
+                    : new List<int>()
             };
         }
 
@@ -1179,15 +1217,9 @@ namespace DTcms.Core.Common.Helpers
                         cpModel.Add(yVars[idx, j]! <= gradeVar);
                     }
 
-                    cpModel.Add(gradeVar <= LinearExpr.Sum(relevantIndexes.Select(idx => yVars[idx, j]!).ToArray()));
-
-                    for (var a = 0; a < relevantIndexes.Count; a++)
-                    {
-                        for (var b = a + 1; b < relevantIndexes.Count; b++)
-                        {
-                            cpModel.Add(yVars[relevantIndexes[a], j]! + yVars[relevantIndexes[b], j]! <= 1);
-                        }
-                    }
+                    var gradeUsage = LinearExpr.Sum(relevantIndexes.Select(idx => yVars[idx, j]!).ToArray());
+                    cpModel.Add(gradeVar <= gradeUsage);
+                    cpModel.Add(gradeUsage <= 1);
 
                     gradeVars.Add(gradeVar);
                 }
@@ -2093,6 +2125,7 @@ namespace DTcms.Core.Common.Helpers
         {
             public int TimeIndex { get; set; }
             public List<int> SubjectIds { get; set; } = new List<int>();
+            public List<int> ClassIds { get; set; } = new List<int>();
         }
 
         #endregion
