@@ -447,15 +447,6 @@ namespace DTcms.Core.Common.Helpers
                 TryAddCandidate(FindBestRoomCombination(available, needed));
             }
 
-            var globalAvailable = buildings
-                .SelectMany(b => b.Rooms)
-                .Where(r => r.AvailableSeats > 0
-                    && !usedRooms.Contains(r.RoomId)
-                    && (avoidRooms == null || !avoidRooms.Contains(r.RoomId)))
-                .ToList();
-
-            TryAddCandidate(FindBestRoomCombination(globalAvailable, needed));
-
             if (candidates.Count == 0)
             {
                 return null;
@@ -681,7 +672,7 @@ namespace DTcms.Core.Common.Helpers
 
             if (grades.Contains(grade))
             {
-                return hasCapacity;
+                return false;
             }
 
             if (grades.Count >= maxGradesPerRoom)
@@ -2325,6 +2316,7 @@ namespace DTcms.Core.Common.Helpers
                 = new Dictionary<int, Dictionary<int, List<ClassRoomSlice>>>();
             private readonly Dictionary<int, Dictionary<int, HashSet<int>>> _subjectRoomBans
                 = new Dictionary<int, Dictionary<int, HashSet<int>>>();
+            private readonly Dictionary<int, int> _classOrder = new Dictionary<int, int>();
 
             private ClassRoomPlanner(List<AIExamModelClass> classes, List<AIExamModelRoom> rooms)
             {
@@ -2332,6 +2324,15 @@ namespace DTcms.Core.Common.Helpers
                 _rooms = rooms ?? new List<AIExamModelRoom>();
                 _classLookup = _classes.ToDictionary(c => c.ModelClassId);
                 _roomLookup = _rooms.ToDictionary(r => r.ModelRoomId);
+
+                for (var i = 0; i < _classes.Count; i++)
+                {
+                    var cls = _classes[i];
+                    if (!_classOrder.ContainsKey(cls.ModelClassId))
+                    {
+                        _classOrder[cls.ModelClassId] = i;
+                    }
+                }
             }
 
             public Dictionary<int, List<ClassRoomSlice>> Plans => _plans;
@@ -2366,7 +2367,14 @@ namespace DTcms.Core.Common.Helpers
 
                 var gradeBuckets = _classes
                     .GroupBy(c => c.NJ)
-                    .Select(g => new GradeBucket(g.Key, g.ToList()))
+                    .Select(g =>
+                    {
+                        var firstIndex = g
+                            .Select(c => _classOrder.TryGetValue(c.ModelClassId, out var idx) ? idx : int.MaxValue)
+                            .DefaultIfEmpty(int.MaxValue)
+                            .Min();
+                        return new GradeBucket(g.Key, g.ToList(), firstIndex);
+                    })
                     .ToList();
 
                 if (gradeBuckets.Count == 0)
@@ -2412,7 +2420,7 @@ namespace DTcms.Core.Common.Helpers
 
             private sealed class GradeBucket
             {
-                public GradeBucket(int grade, List<AIExamModelClass> classes)
+                public GradeBucket(int grade, List<AIExamModelClass> classes, int firstIndex)
                 {
                     Grade = grade;
                     Classes = classes ?? new List<AIExamModelClass>();
@@ -2424,6 +2432,7 @@ namespace DTcms.Core.Common.Helpers
                         ? 0
                         : (double)TotalStudents / Classes.Count;
                     ClassCount = Classes.Count;
+                    FirstIndex = firstIndex;
                 }
 
                 public int Grade { get; }
@@ -2437,6 +2446,8 @@ namespace DTcms.Core.Common.Helpers
                 public double AverageClassSize { get; }
 
                 public int ClassCount { get; }
+
+                public int FirstIndex { get; }
             }
 
             private List<List<GradeBucket>> BuildGradeStrategies(List<GradeBucket> buckets)
@@ -2447,41 +2458,12 @@ namespace DTcms.Core.Common.Helpers
                     return strategies;
                 }
 
-                strategies.Add(buckets.OrderBy(b => b.Grade).ToList());
                 strategies.Add(buckets
-                    .OrderByDescending(b => b.TotalStudents)
-                    .ThenByDescending(b => b.MaxClassSize)
-                    .ThenBy(b => b.Grade)
-                    .ToList());
-                strategies.Add(buckets
-                    .OrderByDescending(b => b.MaxClassSize)
-                    .ThenByDescending(b => b.TotalStudents)
-                    .ThenBy(b => b.Grade)
-                    .ToList());
-                strategies.Add(buckets
-                    .OrderByDescending(b => b.AverageClassSize)
-                    .ThenByDescending(b => b.TotalStudents)
-                    .ThenBy(b => b.Grade)
-                    .ToList());
-                strategies.Add(buckets
-                    .OrderByDescending(b => b.ClassCount)
-                    .ThenByDescending(b => b.TotalStudents)
+                    .OrderBy(b => b.FirstIndex)
                     .ThenBy(b => b.Grade)
                     .ToList());
 
-                var uniqueStrategies = new List<List<GradeBucket>>();
-                var seen = new HashSet<string>();
-
-                foreach (var strategy in strategies)
-                {
-                    var key = string.Join(",", strategy.Select(b => b.Grade));
-                    if (seen.Add(key))
-                    {
-                        uniqueStrategies.Add(strategy);
-                    }
-                }
-
-                return uniqueStrategies;
+                return strategies;
             }
 
             private bool TryAssignGradesWithBacktracking(List<GradeBucket> ordering, StringBuilder error)
@@ -2747,7 +2729,7 @@ namespace DTcms.Core.Common.Helpers
                     .Where(id => _classLookup.ContainsKey(id))
                     .Select(id => _classLookup[id])
                     .Distinct()
-                    .OrderByDescending(c => c.StudentCount)
+                    .OrderBy(c => _classOrder.TryGetValue(c.ModelClassId, out var idx) ? idx : int.MaxValue)
                     .ThenBy(c => c.ModelClassId)
                     .ToList() ?? new List<AIExamModelClass>();
 
@@ -3195,6 +3177,7 @@ namespace DTcms.Core.Common.Helpers
                 return remaining > 0 ? remaining : 0;
             }
 
+
             private bool TryBuildGradePlansForRooms(int grade, List<AIExamModelClass> gradeClasses, List<RoomSnapshot> rooms, out Dictionary<int, List<ClassRoomSlice>> gradePlans, out string? failure)
             {
                 gradePlans = new Dictionary<int, List<ClassRoomSlice>>();
@@ -3222,13 +3205,12 @@ namespace DTcms.Core.Common.Helpers
                 }
 
                 var orderedClasses = gradeClasses
-                    .OrderByDescending(c => c.StudentCount)
+                    .OrderBy(c => _classOrder.TryGetValue(c.ModelClassId, out var idx) ? idx : int.MaxValue)
                     .ThenBy(c => c.ModelClassId)
                     .ToList();
 
                 var currentPlan = new Dictionary<int, List<ClassRoomSlice>>();
                 var usedRooms = new HashSet<int>();
-                var activeStates = new HashSet<string>();
                 var stateResults = new Dictionary<string, string?>();
                 Dictionary<int, List<ClassRoomSlice>>? bestPlan = null;
 
@@ -3236,12 +3218,11 @@ namespace DTcms.Core.Common.Helpers
                 {
                     localFailure = null;
 
-                    var stateKey = BuildStateKey(index);
-
-                    if (stateResults.TryGetValue(stateKey, out var cachedFailure))
+                    var stateKey = BuildStateKey(index, availableRooms.Keys);
+                    if (stateResults.TryGetValue(stateKey, out var cached))
                     {
-                        localFailure = cachedFailure;
-                        return cachedFailure == null;
+                        localFailure = cached;
+                        return cached == null;
                     }
 
                     if (index >= orderedClasses.Count)
@@ -3250,123 +3231,7 @@ namespace DTcms.Core.Common.Helpers
                             kvp => kvp.Key,
                             kvp => kvp.Value.Select(slice => slice.Clone()).ToList());
                         stateResults[stateKey] = null;
-                        activeStates.Remove(stateKey);
                         return true;
-                    }
-
-                    if (!activeStates.Add(stateKey))
-                    {
-                        var loopClass = orderedClasses[Math.Min(index, orderedClasses.Count - 1)];
-                        var loopLabel = loopClass.ModelClassName ?? loopClass.ModelClassId.ToString();
-                        localFailure = $"年级[{grade}]的班级[{loopLabel}]无法找到满足规则的考场组合。";
-                        stateResults[stateKey] = localFailure;
-                        return false;
-                    }
-
-                    var remainingStudentsCount = 0;
-                    for (var i = index; i < orderedClasses.Count; i++)
-                    {
-                        remainingStudentsCount += Math.Max(0, orderedClasses[i].StudentCount);
-                    }
-
-                    var availableSeatSum = 0;
-                    foreach (var snapshot in availableRooms.Values)
-                    {
-                        availableSeatSum += snapshot.AvailableSeats;
-                    }
-
-                    if (remainingStudentsCount == 0)
-                    {
-                        bestPlan = currentPlan.ToDictionary(
-                            kvp => kvp.Key,
-                            kvp => kvp.Value.Select(slice => slice.Clone()).ToList());
-                        stateResults[stateKey] = null;
-                        activeStates.Remove(stateKey);
-                        return true;
-                    }
-
-                    if (availableSeatSum < remainingStudentsCount)
-                    {
-                        var nextClass = orderedClasses[index];
-                        var classLabel = nextClass.ModelClassName ?? nextClass.ModelClassId.ToString();
-                        localFailure = $"年级[{grade}]的班级[{classLabel}]所需座位超过剩余考场容量，无法满足分配规则。";
-                        stateResults[stateKey] = localFailure;
-                        activeStates.Remove(stateKey);
-                        return false;
-                    }
-
-                    var bestIndex = -1;
-                    List<ClassRoomAllocationOption>? selectedOptions = null;
-                    AIExamModelClass? selectedClass = null;
-                    var bestOptionCount = int.MaxValue;
-                    var bestWasteScore = int.MaxValue;
-
-                    for (var i = index; i < orderedClasses.Count; i++)
-                    {
-                        var candidate = orderedClasses[i];
-
-                        if (candidate.StudentCount <= 0)
-                        {
-                            bestIndex = i;
-                            selectedClass = candidate;
-                            selectedOptions = new List<ClassRoomAllocationOption>
-                            {
-                                new ClassRoomAllocationOption(new List<ClassRoomSlice>(), 0, 0),
-                            };
-                            bestOptionCount = 0;
-                            bestWasteScore = 0;
-                            break;
-                        }
-
-                        var candidateOptions = GenerateClassAllocationOptions(
-                            candidate,
-                            availableRooms,
-                            usedRooms,
-                            null,
-                            12);
-
-                        if (candidateOptions.Count == 0)
-                        {
-                            var label = candidate.ModelClassName ?? candidate.ModelClassId.ToString();
-                            localFailure = $"年级[{grade}]的班级[{label}]无法找到满足规则的考场组合。";
-                            stateResults[stateKey] = localFailure;
-                            activeStates.Remove(stateKey);
-                            return false;
-                        }
-
-                        var optionCount = candidateOptions.Count;
-                        var wasteScore = candidateOptions.Min(option => option.Waste);
-
-                        if (optionCount < bestOptionCount
-                            || (optionCount == bestOptionCount && wasteScore < bestWasteScore)
-                            || (optionCount == bestOptionCount && wasteScore == bestWasteScore
-                                && candidate.StudentCount > (selectedClass?.StudentCount ?? -1)))
-                        {
-                            bestIndex = i;
-                            selectedClass = candidate;
-                            selectedOptions = candidateOptions;
-                            bestOptionCount = optionCount;
-                            bestWasteScore = wasteScore;
-
-                            if (bestOptionCount == 1 && bestWasteScore == 0)
-                            {
-                                break;
-                            }
-                        }
-                    }
-
-                    if (selectedClass == null || selectedOptions == null)
-                    {
-                        localFailure = $"年级[{grade}]没有可用考场满足分配规则。";
-                        stateResults[stateKey] = localFailure;
-                        activeStates.Remove(stateKey);
-                        return false;
-                    }
-
-                    var swapped = bestIndex > index;
-                    if (swapped)
-                    {
-                        (orderedClasses[index], orderedClasses[bestIndex]) = (orderedClasses[bestIndex], orderedClasses[index]);
                     }
 
                     var cls = orderedClasses[index];
@@ -3375,57 +3240,66 @@ namespace DTcms.Core.Common.Helpers
                     if (cls.StudentCount <= 0)
                     {
                         currentPlan[classId] = new List<ClassRoomSlice>();
-                        var finished = Search(index + 1, out localFailure);
-                        if (finished)
+                        if (Search(index + 1, out var deeperSuccess))
                         {
                             stateResults[stateKey] = null;
+                            return true;
                         }
-                        else
-                        {
-                            currentPlan.Remove(classId);
-                            stateResults[stateKey] = localFailure;
-                        }
-                        activeStates.Remove(stateKey);
-                        if (swapped)
-                        {
-                            (orderedClasses[index], orderedClasses[bestIndex]) = (orderedClasses[bestIndex], orderedClasses[index]);
-                        }
-                        return finished;
+
+                        currentPlan.Remove(classId);
+                        localFailure = deeperSuccess;
+                        stateResults[stateKey] = localFailure;
+                        return false;
                     }
 
-                    var options = selectedOptions;
+                    if (availableRooms.Count == 0)
+                    {
+                        var label = cls.ModelClassName ?? classId.ToString();
+                        localFailure = $"年级[{grade}]的班级[{label}]无法找到满足规则的考场组合。";
+                        stateResults[stateKey] = localFailure;
+                        return false;
+                    }
+
+                    var options = GenerateClassAllocationOptions(
+                        cls,
+                        availableRooms,
+                        usedRooms,
+                        avoidRooms,
+                        Math.Max(6, availableRooms.Count));
 
                     if (options.Count == 0)
                     {
-                        var classLabel = cls.ModelClassName ?? classId.ToString();
-                        localFailure = $"年级[{grade}]的班级[{classLabel}]无法找到满足规则的考场组合。";
+                        var label = cls.ModelClassName ?? classId.ToString();
+                        localFailure = $"年级[{grade}]的班级[{label}]无法找到满足规则的考场组合。";
                         stateResults[stateKey] = localFailure;
-                        activeStates.Remove(stateKey);
                         return false;
                     }
 
                     foreach (var option in options)
                     {
                         var removed = new List<RoomSnapshot>();
+                        var addedRooms = new List<int>();
                         var valid = true;
 
-                        foreach (var roomId in option.RoomIds)
+                        foreach (var slice in option.Slices)
                         {
-                            if (!availableRooms.TryGetValue(roomId, out var snapshot))
+                            if (!availableRooms.TryGetValue(slice.RoomId, out var snapshot))
                             {
                                 valid = false;
                                 break;
                             }
 
                             removed.Add(snapshot);
-                            availableRooms.Remove(roomId);
-                            usedRooms.Add(roomId);
+                            availableRooms.Remove(slice.RoomId);
+                            usedRooms.Add(slice.RoomId);
+                            addedRooms.Add(slice.RoomId);
                         }
 
                         if (!valid)
                         {
-                            foreach (var snapshot in removed)
+                            for (var i = removed.Count - 1; i >= 0; i--)
                             {
+                                var snapshot = removed[i];
                                 availableRooms[snapshot.RoomId] = snapshot;
                                 usedRooms.Remove(snapshot.RoomId);
                             }
@@ -3438,86 +3312,55 @@ namespace DTcms.Core.Common.Helpers
                         if (Search(index + 1, out var deeperFailure))
                         {
                             stateResults[stateKey] = null;
-                            activeStates.Remove(stateKey);
-                            if (swapped)
-                            {
-                                (orderedClasses[index], orderedClasses[bestIndex]) = (orderedClasses[bestIndex], orderedClasses[index]);
-                            }
                             return true;
                         }
 
-                        localFailure = deeperFailure;
                         currentPlan.Remove(classId);
+
+                        if (!string.IsNullOrEmpty(deeperFailure))
+                        {
+                            localFailure = deeperFailure;
+                        }
 
                         for (var i = removed.Count - 1; i >= 0; i--)
                         {
                             var snapshot = removed[i];
                             availableRooms[snapshot.RoomId] = snapshot;
-                            usedRooms.Remove(snapshot.RoomId);
+                        }
+
+                        for (var i = 0; i < addedRooms.Count; i++)
+                        {
+                            usedRooms.Remove(addedRooms[i]);
                         }
                     }
 
                     if (localFailure == null)
                     {
-                        var classLabel = cls.ModelClassName ?? classId.ToString();
-                        localFailure = $"年级[{grade}]的班级[{classLabel}]无法找到满足规则的考场组合。";
+                        var label = cls.ModelClassName ?? classId.ToString();
+                        localFailure = $"年级[{grade}]的班级[{label}]无法找到满足规则的考场组合。";
                     }
 
                     stateResults[stateKey] = localFailure;
-                    activeStates.Remove(stateKey);
-
-                    if (swapped)
-                    {
-                        (orderedClasses[index], orderedClasses[bestIndex]) = (orderedClasses[bestIndex], orderedClasses[index]);
-                    }
-
                     return false;
                 }
 
-                if (Search(0, out failure) && bestPlan != null)
+                if (Search(0, out var searchFailure) && bestPlan != null)
                 {
                     gradePlans = bestPlan;
                     return true;
                 }
 
+                failure = searchFailure;
                 gradePlans = new Dictionary<int, List<ClassRoomSlice>>();
                 return false;
 
-                string BuildStateKey(int index)
+                static string BuildStateKey(int index, IEnumerable<int> roomIds)
                 {
                     var builder = new StringBuilder();
                     builder.Append(index);
                     builder.Append('|');
 
-                    if (index < orderedClasses.Count)
-                    {
-                        var classIds = new List<int>();
-                        for (var i = index; i < orderedClasses.Count; i++)
-                        {
-                            classIds.Add(orderedClasses[i].ModelClassId);
-                        }
-
-                        classIds.Sort();
-
-                        for (var i = 0; i < classIds.Count; i++)
-                        {
-                            if (i > 0)
-                            {
-                                builder.Append(',');
-                            }
-
-                            builder.Append(classIds[i]);
-                        }
-                    }
-
-                    builder.Append('|');
-
-                    if (availableRooms.Count == 0)
-                    {
-                        return builder.ToString();
-                    }
-
-                    var orderedRoomIds = availableRooms.Keys
+                    var orderedRoomIds = roomIds
                         .OrderBy(id => id)
                         .ToList();
 
@@ -3628,8 +3471,6 @@ namespace DTcms.Core.Common.Helpers
 
                     AddCandidates(buildingGroup);
                 }
-
-                AddCandidates(eligibleRooms);
 
                 options = options
                     .OrderBy(o => o.Slices.Count)
