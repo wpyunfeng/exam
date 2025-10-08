@@ -450,11 +450,6 @@ namespace DTcms.Core.Common.Helpers
                 }
             }
 
-            foreach (var kv in subjectStartVars)
-            {
-                result.SubjectStartOffsets[kv.Key] = (int)solver.Value(kv.Value);
-            }
-
             return result;
         }
 
@@ -1266,7 +1261,8 @@ namespace DTcms.Core.Common.Helpers
                     var duration = subjectDurations[subjectId];
                     var startVar = subjectStartVars[subjectId];
                     var endVar = subjectEndVars[subjectId];
-                    intervals.Add(cpModel.NewOptionalIntervalVar(startVar, duration, endVar, variable));
+                    var intervalName = $"room_{roomCandidates[j].Room.RoomId}_subject_{subjectId}_interval";
+                    intervals.Add(cpModel.NewOptionalIntervalVar(startVar, duration, endVar, variable, intervalName));
                 }
 
                 cpModel.AddNoOverlap(intervals);
