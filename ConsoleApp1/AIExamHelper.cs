@@ -1012,6 +1012,12 @@ namespace DTcms.Core.Common.Helpers
                             eventsLookup[key] = roomEvents;
                         }
 
+                        if (roomEvents.Any(e => e.Subject.SubjectId != request.Subject.SubjectId))
+                        {
+                            error.AppendLine($"考场 {allocation.Room.Room.ModelRoomName ?? allocation.Room.RoomId.ToString()} 在 {slot.Date} {slot.Start:HH:mm} 已安排其他考试科目，无法同时安排科目 {request.Subject.Subject.ModelSubjectName ?? request.Subject.SubjectId.ToString()}。");
+                            return null;
+                        }
+
                         var roomEvent = roomEvents.FirstOrDefault(e => e.Subject.SubjectId == request.Subject.SubjectId);
                         if (roomEvent == null)
                         {
@@ -1412,6 +1418,8 @@ namespace DTcms.Core.Common.Helpers
                 if (subjectVars.Count > 0)
                 {
                     var subjectBoolVars = subjectVars.Select(v => v.variable).ToArray();
+                    cpModel.Add(LinearExpr.Sum(subjectBoolVars) <= 1);
+
                     var durationExpr = LinearExpr.Sum(subjectVars.Select(v => subjectDurations[v.subjectId] * v.variable).ToArray());
                     var countVar = cpModel.NewIntVar(0, subjectVars.Count, $"room_{roomCandidates[j].Room.RoomId}_subject_count");
                     cpModel.Add(countVar == LinearExpr.Sum(subjectBoolVars));
