@@ -14,6 +14,8 @@ namespace DTcms.Core.Common.Helpers
     /// </summary>
     public static class AIExamHelper
     {
+        private const int MaxRoomCandidatesPerClass = 15;
+
         /// <summary>
         /// 自动排考
         /// </summary>
@@ -805,6 +807,52 @@ namespace DTcms.Core.Common.Helpers
                             return null;
                         }
 
+                        if (candidateIndices.Count > MaxRoomCandidatesPerClass)
+                        {
+                            var originalCandidates = candidateIndices.ToList();
+                            var preferredSet = new HashSet<int>();
+                            if (classPreferences.TryGetValue(cls.Class.ModelClassId, out var existingPreference))
+                            {
+                                foreach (var preferredRoomId in existingPreference.RoomIds)
+                                {
+                                    var index = originalCandidates.FindIndex(idx => slotRooms[idx].Room.RoomId == preferredRoomId);
+                                    if (index >= 0)
+                                    {
+                                        preferredSet.Add(originalCandidates[index]);
+                                    }
+                                }
+                            }
+
+                            foreach (var preferredIndex in request.PreferredRooms)
+                            {
+                                if (preferredIndex >= 0 && preferredIndex < slotRooms.Count && originalCandidates.Contains(preferredIndex))
+                                {
+                                    preferredSet.Add(preferredIndex);
+                                }
+                            }
+
+                            var ordered = originalCandidates
+                                .OrderBy(idx => Math.Max(0, slotRooms[idx].AvailableSeats - cls.StudentCount))
+                                .ThenBy(idx => slotRooms[idx].Room.SeatCount)
+                                .ThenBy(idx => slotRooms[idx].Room.RoomNo ?? int.MaxValue)
+                                .ThenBy(idx => slotRooms[idx].Room.RoomId)
+                                .ToList();
+
+                            var limitedList = ordered.Take(MaxRoomCandidatesPerClass).ToList();
+                            var unionSet = new HashSet<int>(limitedList);
+                            foreach (var preferred in preferredSet)
+                            {
+                                unionSet.Add(preferred);
+                            }
+
+                            candidateIndices = originalCandidates.Where(unionSet.Contains).ToList();
+
+                            if (candidateIndices.Count == 0)
+                            {
+                                candidateIndices = limitedList.Count > 0 ? limitedList : originalCandidates;
+                            }
+                        }
+
                         var classId = cls.Class.ModelClassId;
 
                         if (classPreferences.TryGetValue(classId, out var preference))
@@ -922,7 +970,7 @@ namespace DTcms.Core.Common.Helpers
                     return null;
                 }
 
-                var subjectOffsets = allocationResult.SubjectStartOffsets;
+                var subjectOffsets = BuildSubjectOffsets(slotSubjects, slot, config);
 
                 foreach (var request in slotClassRequests)
                 {
@@ -1163,6 +1211,42 @@ namespace DTcms.Core.Common.Helpers
             return true;
         }
 
+        private static Dictionary<int, int> BuildSubjectOffsets(List<SubjectInfo> slotSubjects, TimeSlotInfo slot, AIExamConfig config)
+        {
+            var offsets = new Dictionary<int, int>();
+            if (slotSubjects.Count == 0)
+            {
+                return offsets;
+            }
+
+            var slotDuration = (int)Math.Max(0, Math.Round((slot.End - slot.Start).TotalMinutes));
+            if (slotDuration <= 0)
+            {
+                return offsets;
+            }
+
+            var current = 0;
+            var gap = Math.Max(0, config.MinExamInterval);
+
+            foreach (var subject in slotSubjects)
+            {
+                var duration = subject.Duration > 0 ? subject.Duration : slotDuration;
+                duration = Math.Max(1, Math.Min(duration, slotDuration));
+
+                if (current + duration > slotDuration)
+                {
+                    current = Math.Max(0, slotDuration - duration);
+                }
+
+                offsets[subject.SubjectId] = current;
+
+                var next = current + duration + gap;
+                current = Math.Min(next, slotDuration);
+            }
+
+            return offsets;
+        }
+
         private static SlotRoomAllocationResult? SolveSlotRoomAllocationWithCp(
             List<SlotClassRequest> slotClasses,
             List<RoomCandidate> roomCandidates,
@@ -1291,8 +1375,6 @@ namespace DTcms.Core.Common.Helpers
                 .ToDictionary(g => g.Key, g => g.Select(x => x.index).ToList());
 
             var subjectDurations = new Dictionary<int, int>();
-            var subjectStartVars = new Dictionary<int, IntVar>();
-            var subjectEndVars = new Dictionary<int, IntVar>();
 
             foreach (var kv in classesBySubject)
             {
@@ -1309,11 +1391,6 @@ namespace DTcms.Core.Common.Helpers
                 }
 
                 subjectDurations[subjectId] = duration;
-                var startVar = cpModel.NewIntVar(0, slotDuration - duration, $"subject_{subjectId}_start");
-                var endVar = cpModel.NewIntVar(duration, slotDuration, $"subject_{subjectId}_end");
-                cpModel.Add(endVar == startVar + duration);
-                subjectStartVars[subjectId] = startVar;
-                subjectEndVars[subjectId] = endVar;
             }
 
             for (var j = 0; j < roomCount; j++)
@@ -1337,45 +1414,20 @@ namespace DTcms.Core.Common.Helpers
                     subjectVars.Add((kv.Key, subjectVar));
                 }
 
-                if (subjectVars.Count == 0)
+                if (subjectVars.Count > 0)
                 {
-                    continue;
-                }
+                    var subjectBoolVars = subjectVars.Select(v => v.variable).ToArray();
+                    var durationExpr = LinearExpr.Sum(subjectVars.Select(v => subjectDurations[v.subjectId] * v.variable).ToArray());
+                    var countVar = cpModel.NewIntVar(0, subjectVars.Count, $"room_{roomCandidates[j].Room.RoomId}_subject_count");
+                    cpModel.Add(countVar == LinearExpr.Sum(subjectBoolVars));
 
-                var intervals = new List<IntervalVar>();
-                foreach (var (subjectId, variable) in subjectVars)
-                {
-                    var duration = subjectDurations[subjectId];
-                    var startVar = subjectStartVars[subjectId];
-                    var endVar = subjectEndVars[subjectId];
-                    var intervalName = $"room_{roomCandidates[j].Room.RoomId}_subject_{subjectId}_interval";
-                    intervals.Add(cpModel.NewOptionalIntervalVar(startVar, duration, endVar, variable, intervalName));
-                }
-
-                cpModel.AddNoOverlap(intervals);
-
-                if (config.MinExamInterval > 0 && subjectVars.Count > 1)
-                {
-                    for (var a = 0; a < subjectVars.Count; a++)
+                    if (config.MinExamInterval > 0)
                     {
-                        for (var b = a + 1; b < subjectVars.Count; b++)
-                        {
-                            var subjectA = subjectVars[a];
-                            var subjectB = subjectVars[b];
-
-                            var orderAB = cpModel.NewBoolVar($"room_{roomCandidates[j].Room.RoomId}_order_{subjectA.subjectId}_{subjectB.subjectId}_ab");
-                            var orderBA = cpModel.NewBoolVar($"room_{roomCandidates[j].Room.RoomId}_order_{subjectB.subjectId}_{subjectA.subjectId}_ba");
-
-                            cpModel.Add(orderAB <= subjectA.variable);
-                            cpModel.Add(orderAB <= subjectB.variable);
-                            cpModel.Add(orderBA <= subjectA.variable);
-                            cpModel.Add(orderBA <= subjectB.variable);
-                            cpModel.Add(orderAB + orderBA >= subjectA.variable + subjectB.variable - 1);
-                            cpModel.Add(orderAB + orderBA <= 1);
-
-                            cpModel.Add(subjectEndVars[subjectA.subjectId] + config.MinExamInterval <= subjectStartVars[subjectB.subjectId]).OnlyEnforceIf(orderAB);
-                            cpModel.Add(subjectEndVars[subjectB.subjectId] + config.MinExamInterval <= subjectStartVars[subjectA.subjectId]).OnlyEnforceIf(orderBA);
-                        }
+                        cpModel.Add(durationExpr + config.MinExamInterval * countVar <= slotDuration + config.MinExamInterval);
+                    }
+                    else
+                    {
+                        cpModel.Add(durationExpr <= slotDuration);
                     }
                 }
             }
@@ -1595,11 +1647,6 @@ namespace DTcms.Core.Common.Helpers
                         }
                     }
                 }
-            }
-
-            foreach (var kv in subjectStartVars)
-            {
-                result.SubjectStartOffsets[kv.Key] = (int)solver.Value(kv.Value);
             }
 
             return result;
@@ -2160,7 +2207,6 @@ namespace DTcms.Core.Common.Helpers
         {
             public Dictionary<(int subjectId, int classId), List<RoomAllocation>> ClassAllocations { get; } = new Dictionary<(int subjectId, int classId), List<RoomAllocation>>();
             public Dictionary<int, int> ClassBuilding { get; } = new Dictionary<int, int>();
-            public Dictionary<int, int> SubjectStartOffsets { get; } = new Dictionary<int, int>();
         }
 
         private sealed class ClassRoomPreference
