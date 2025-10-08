@@ -12,7 +12,7 @@ namespace DTcms.Core.Common.Helpers
     /// <summary>
     /// 排考帮助类
     /// </summary>
-    public static class AIExamHelper
+    public static partial class AIExamHelper
     {
         /// <summary>
         /// 自动排考
