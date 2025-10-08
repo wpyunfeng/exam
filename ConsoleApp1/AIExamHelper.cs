@@ -3137,13 +3137,13 @@ namespace DTcms.Core.Common.Helpers
                 if (avoidRooms != null && avoidRooms.Count > 0)
                 {
                     var filtered = availableRooms.Where(r => !avoidRooms.Contains(r.RoomId)).ToList();
-                    if (filtered.Count > 0 && TryBuildGradePlansForRooms(grade, gradeClasses, filtered, out gradePlans, out failure))
+                    if (filtered.Count > 0 && TryBuildGradePlansForRooms(grade, gradeClasses, filtered, avoidRooms, out gradePlans, out failure))
                     {
                         return true;
                     }
                 }
 
-                return TryBuildGradePlansForRooms(grade, gradeClasses, availableRooms, out gradePlans, out failure);
+                return TryBuildGradePlansForRooms(grade, gradeClasses, availableRooms, avoidRooms, out gradePlans, out failure);
             }
 
             private List<RoomSnapshot> GetAvailableRoomsForGrade(int grade)
@@ -3178,7 +3178,7 @@ namespace DTcms.Core.Common.Helpers
             }
 
 
-            private bool TryBuildGradePlansForRooms(int grade, List<AIExamModelClass> gradeClasses, List<RoomSnapshot> rooms, out Dictionary<int, List<ClassRoomSlice>> gradePlans, out string? failure)
+            private bool TryBuildGradePlansForRooms(int grade, List<AIExamModelClass> gradeClasses, List<RoomSnapshot> rooms, HashSet<int>? avoidRooms, out Dictionary<int, List<ClassRoomSlice>> gradePlans, out string? failure)
             {
                 gradePlans = new Dictionary<int, List<ClassRoomSlice>>();
                 failure = null;
