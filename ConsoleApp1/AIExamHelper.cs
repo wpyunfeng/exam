@@ -1369,6 +1369,12 @@ namespace DTcms.Core.Common.Helpers
                         continue;
                     }
 
+                    var subjectUsageVars = relevantIndexes
+                        .Select(idx => yVars[idx, j]!)
+                        .ToArray();
+
+                    cpModel.Add(LinearExpr.Sum(subjectUsageVars) <= 1);
+
                     var gradeIndicators = new List<BoolVar>();
                     foreach (var gradeGroup in relevantIndexes
                         .GroupBy(idx => slotClasses[idx].Class.Grade))
