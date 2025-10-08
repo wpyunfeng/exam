@@ -1084,6 +1084,47 @@ namespace DTcms.Core.Common.Helpers
                         }
 
                         var roomEvent = roomEvents.FirstOrDefault(e => e.Subject.SubjectId == request.Subject.SubjectId);
+
+                        if (roomEvent == null)
+                        {
+                            foreach (var existingGlobalEvent in container.RoomEvents.Where(e => e.Room.RoomId == allocation.Room.RoomId))
+                            {
+                                if (existingGlobalEvent.Slot.Index == slot.Index && existingGlobalEvent.Subject.SubjectId == subjectId)
+                                {
+                                    continue;
+                                }
+
+                                var existingDuration = GetSubjectDurationForSlot(existingGlobalEvent.Subject, existingGlobalEvent.Slot);
+                                if (existingDuration <= 0)
+                                {
+                                    continue;
+                                }
+
+                                var existingStart = existingGlobalEvent.Slot.Start.AddMinutes(existingGlobalEvent.StartOffsetMinutes);
+                                var existingEnd = existingStart.AddMinutes(existingDuration);
+                                if (existingEnd > existingGlobalEvent.Slot.End)
+                                {
+                                    existingEnd = existingGlobalEvent.Slot.End;
+                                }
+
+                                if (!HasSufficientGap(existingStart, existingEnd, eventStart, eventEnd, config.MinExamInterval))
+                                {
+                                    var conflictSubjects = new HashSet<int> { subjectId, existingGlobalEvent.Subject.SubjectId };
+                                    var conflictClassIds = new HashSet<int> { request.Class.Class.ModelClassId };
+                                    conflictClassIds.UnionWith(existingGlobalEvent.ClassShares.Select(share => share.Class.Class.ModelClassId));
+
+                                    conflict = new SlotTimeConflict
+                                    {
+                                        TimeIndex = slot.Index,
+                                        SubjectIds = conflictSubjects.ToList(),
+                                        ClassIds = conflictClassIds.ToList()
+                                    };
+
+                                    return null;
+                                }
+                            }
+                        }
+
                         if (roomEvent == null)
                         {
                             roomEvent = new RoomEvent
