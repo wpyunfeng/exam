@@ -936,7 +936,14 @@ namespace DTcms.Core.Common.Helpers
                         continue;
                     }
 
-                    allocationResult = SolveSlotRoomAllocationWithCp(stagedRequests, filteredRooms, classPreferences, slot, config);
+                    allocationResult = SolveSlotRoomAllocationWithCp(
+                        stagedRequests,
+                        filteredRooms,
+                        classPreferences,
+                        slot,
+                        config,
+                        slotSubjects,
+                        model);
                     if (allocationResult != null)
                     {
                         slotClassRequests = stagedRequests;
@@ -970,11 +977,22 @@ namespace DTcms.Core.Common.Helpers
                     return null;
                 }
 
-                var subjectOffsets = ComputeSubjectStartOffsets(slotSubjects, slot, allocationResult, config, model);
-                if (subjectOffsets == null)
+                var subjectOffsets = allocationResult.SubjectStartOffsets;
+                if (subjectOffsets.Count == 0)
                 {
-                    error.AppendLine($"无法在场次 {slot.Date} {slot.Start:HH:mm} 为科目的考试安排合适的开始时间。");
-                    return null;
+                    var fallbackOffsets = ComputeSubjectStartOffsets(slotSubjects, slot, allocationResult, config, model);
+                    if (fallbackOffsets == null)
+                    {
+                        error.AppendLine($"无法在场次 {slot.Date} {slot.Start:HH:mm} 为科目的考试安排合适的开始时间。");
+                        return null;
+                    }
+
+                    subjectOffsets = fallbackOffsets;
+                    allocationResult.SubjectStartOffsets.Clear();
+                    foreach (var kv in fallbackOffsets)
+                    {
+                        allocationResult.SubjectStartOffsets[kv.Key] = kv.Value;
+                    }
                 }
 
                 if (!ValidateRoomSchedules(slotSubjects, allocationResult, slot, subjectOffsets, config, out var scheduleConflict))
@@ -1687,7 +1705,9 @@ namespace DTcms.Core.Common.Helpers
             List<RoomCandidate> roomCandidates,
             Dictionary<int, ClassRoomPreference> classPreferences,
             TimeSlotInfo slot,
-            AIExamConfig config)
+            AIExamConfig config,
+            List<SubjectInfo> slotSubjects,
+            AIExamModel model)
         {
             if (slotClasses.Count == 0 || roomCandidates.Count == 0)
             {
@@ -1703,6 +1723,144 @@ namespace DTcms.Core.Common.Helpers
             var cpModel = new CpModel();
             var classCount = slotClasses.Count;
             var roomCount = roomCandidates.Count;
+
+            var subjectLookup = slotSubjects
+                .GroupBy(s => s.SubjectId)
+                .Select(g => g.First())
+                .ToDictionary(s => s.SubjectId, s => s);
+
+            var durations = new Dictionary<int, int>();
+            foreach (var subject in subjectLookup.Values)
+            {
+                if (!TryGetSubjectDuration(subject, slotDuration, out var duration))
+                {
+                    return null;
+                }
+
+                durations[subject.SubjectId] = duration;
+            }
+
+            var fixedOffsets = new Dictionary<int, int>();
+            foreach (var subject in subjectLookup.Values)
+            {
+                if (TryGetStartOffset(subject.Subject.StartTime, slot, out var fixedOffset))
+                {
+                    var maxOffset = slotDuration - durations[subject.SubjectId];
+                    if (fixedOffset < 0 || fixedOffset > maxOffset)
+                    {
+                        return null;
+                    }
+
+                    fixedOffsets[subject.SubjectId] = fixedOffset;
+                }
+            }
+
+            if (model.RuleJointSubjectList != null)
+            {
+                foreach (var rule in model.RuleJointSubjectList)
+                {
+                    if (rule.RuleJointSubjectList == null)
+                    {
+                        continue;
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(rule.Date) &&
+                        !rule.Date.Equals(slot.Date, StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    var group = rule.RuleJointSubjectList
+                        .Select(item => item.ModelSubjectId)
+                        .Where(subjectLookup.ContainsKey)
+                        .Distinct()
+                        .ToList();
+
+                    if (group.Count == 0)
+                    {
+                        continue;
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(rule.StartTime))
+                    {
+                        if (!TryGetStartOffset(rule.StartTime, slot, out var groupOffset))
+                        {
+                            return null;
+                        }
+
+                        foreach (var subjectId in group)
+                        {
+                            var maxOffset = slotDuration - durations[subjectId];
+                            if (groupOffset < 0 || groupOffset > maxOffset)
+                            {
+                                return null;
+                            }
+
+                            if (fixedOffsets.TryGetValue(subjectId, out var existing) && existing != groupOffset)
+                            {
+                                return null;
+                            }
+
+                            fixedOffsets[subjectId] = groupOffset;
+                        }
+                    }
+                }
+            }
+
+            var startVars = new Dictionary<int, IntVar>();
+            foreach (var subject in subjectLookup.Values)
+            {
+                var duration = durations[subject.SubjectId];
+                var maxOffset = slotDuration - duration;
+                if (maxOffset < 0)
+                {
+                    return null;
+                }
+
+                var startVar = cpModel.NewIntVar(0, maxOffset, $"slot_{slot.Index}_subject_{subject.SubjectId}_start");
+                cpModel.Add(startVar + duration <= slotDuration);
+
+                if (fixedOffsets.TryGetValue(subject.SubjectId, out var fixedOffset))
+                {
+                    cpModel.Add(startVar == fixedOffset);
+                }
+
+                startVars[subject.SubjectId] = startVar;
+            }
+
+            if (model.RuleJointSubjectList != null)
+            {
+                foreach (var rule in model.RuleJointSubjectList)
+                {
+                    if (rule.RuleJointSubjectList == null)
+                    {
+                        continue;
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(rule.Date) &&
+                        !rule.Date.Equals(slot.Date, StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    var group = rule.RuleJointSubjectList
+                        .Select(item => item.ModelSubjectId)
+                        .Where(startVars.ContainsKey)
+                        .Distinct()
+                        .ToList();
+
+                    if (group.Count <= 1)
+                    {
+                        continue;
+                    }
+
+                    var anchor = group[0];
+                    foreach (var subjectId in group.Skip(1))
+                    {
+                        cpModel.Add(startVars[subjectId] == startVars[anchor]);
+                    }
+                }
+            }
 
             var xVars = new IntVar?[classCount, roomCount];
             var yVars = new BoolVar?[classCount, roomCount];
@@ -1774,25 +1932,6 @@ namespace DTcms.Core.Common.Helpers
                 .GroupBy(x => x.cls.Subject.SubjectId)
                 .ToDictionary(g => g.Key, g => g.Select(x => x.index).ToList());
 
-            var subjectDurations = new Dictionary<int, int>();
-
-            foreach (var kv in classesBySubject)
-            {
-                var subjectId = kv.Key;
-                var duration = slotClasses[kv.Value.First()].Subject.Duration > 0
-                    ? slotClasses[kv.Value.First()].Subject.Duration
-                    : slotDuration;
-
-                duration = Math.Max(1, duration);
-
-                if (duration > slotDuration)
-                {
-                    return null;
-                }
-
-                subjectDurations[subjectId] = duration;
-            }
-
             for (var j = 0; j < roomCount; j++)
             {
                 var subjectVars = new List<(int subjectId, BoolVar variable)>();
@@ -1845,7 +1984,7 @@ namespace DTcms.Core.Common.Helpers
                 if (subjectVars.Count > 0)
                 {
                     var subjectBoolVars = subjectVars.Select(v => v.variable).ToArray();
-                    var durationExpr = LinearExpr.Sum(subjectVars.Select(v => v.variable * subjectDurations[v.subjectId]).ToArray());
+                    var durationExpr = LinearExpr.Sum(subjectVars.Select(v => v.variable * durations[v.subjectId]).ToArray());
                     var countVar = cpModel.NewIntVar(0, subjectVars.Count, $"room_{roomCandidates[j].Room.RoomId}_subject_count");
                     cpModel.Add(countVar == LinearExpr.Sum(subjectBoolVars));
 
@@ -1856,6 +1995,36 @@ namespace DTcms.Core.Common.Helpers
                     else
                     {
                         cpModel.Add(durationExpr <= slotDuration);
+                    }
+
+                    var gap = Math.Max(0, config.MinExamInterval);
+                    var bigM = slotDuration + gap;
+                    for (var a = 0; a < subjectVars.Count; a++)
+                    {
+                        for (var b = a + 1; b < subjectVars.Count; b++)
+                        {
+                            var subjectA = subjectVars[a].subjectId;
+                            var subjectB = subjectVars[b].subjectId;
+
+                            if (!startVars.ContainsKey(subjectA) || !startVars.ContainsKey(subjectB))
+                            {
+                                continue;
+                            }
+
+                            var pairActive = cpModel.NewBoolVar($"room_{roomCandidates[j].Room.RoomId}_subjects_{subjectA}_{subjectB}_active");
+                            cpModel.Add(pairActive <= subjectVars[a].variable);
+                            cpModel.Add(pairActive <= subjectVars[b].variable);
+                            cpModel.Add(pairActive >= subjectVars[a].variable + subjectVars[b].variable - 1);
+
+                            var orderVar = cpModel.NewBoolVar($"room_{roomCandidates[j].Room.RoomId}_subjects_{subjectA}_{subjectB}_order");
+                            cpModel.Add(orderVar <= pairActive);
+                            cpModel.Add(orderVar == 0).OnlyEnforceIf(pairActive.Not());
+
+                            cpModel.Add(startVars[subjectA] + durations[subjectA] + gap <= startVars[subjectB] + bigM * (1 - orderVar))
+                                .OnlyEnforceIf(pairActive);
+                            cpModel.Add(startVars[subjectB] + durations[subjectB] + gap <= startVars[subjectA] + bigM * orderVar)
+                                .OnlyEnforceIf(pairActive);
+                        }
                     }
                 }
             }
@@ -2031,6 +2200,14 @@ namespace DTcms.Core.Common.Helpers
             }
 
             var result = new SlotRoomAllocationResult();
+            foreach (var subject in subjectLookup.Values)
+            {
+                if (startVars.TryGetValue(subject.SubjectId, out var startVar))
+                {
+                    result.SubjectStartOffsets[subject.SubjectId] = (int)solver.Value(startVar);
+                }
+            }
+
             for (var i = 0; i < classCount; i++)
             {
                 var request = slotClasses[i];
@@ -2635,6 +2812,7 @@ namespace DTcms.Core.Common.Helpers
         {
             public Dictionary<(int subjectId, int classId), List<RoomAllocation>> ClassAllocations { get; } = new Dictionary<(int subjectId, int classId), List<RoomAllocation>>();
             public Dictionary<int, int> ClassBuilding { get; } = new Dictionary<int, int>();
+            public Dictionary<int, int> SubjectStartOffsets { get; } = new Dictionary<int, int>();
         }
 
         private sealed class ClassRoomPreference
