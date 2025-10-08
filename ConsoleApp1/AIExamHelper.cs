@@ -76,17 +76,22 @@ namespace DTcms.Core.Common.Helpers
 
             var maxIterations = (int)Math.Max(1, Math.Min(50L, Math.Max(1L, (long)Math.Max(1, subjects.Count) * Math.Max(1, timeSlots.Count))));
             var attempt = 0;
+            var needTimeSolve = true;
 
             while (attempt < maxIterations)
             {
                 attempt++;
-                var errorLengthBeforeSolve = error.Length;
 
-                subjectTimeAssignments = SolveSubjectTimeAllocation(config, subjects, timeSlots, model, conflictCuts, error);
-                if (subjectTimeAssignments == null)
+                if (needTimeSolve || subjectTimeAssignments == null)
                 {
-                    throw new ResponseException(error.ToString(), ErrorCode.ParamError);
+                    subjectTimeAssignments = SolveSubjectTimeAllocation(config, subjects, timeSlots, model, conflictCuts, error);
+                    if (subjectTimeAssignments == null)
+                    {
+                        throw new ResponseException(error.ToString(), ErrorCode.ParamError);
+                    }
                 }
+
+                var errorLengthBeforeRooms = error.Length;
 
                 roomAssignments = AllocateRooms(subjects, rooms, timeSlots, subjectTimeAssignments, model, config, persistentClassPreferences, out var conflict, error);
                 if (roomAssignments != null)
@@ -94,30 +99,20 @@ namespace DTcms.Core.Common.Helpers
                     break;
                 }
 
+                error.Length = errorLengthBeforeRooms;
+
                 if (conflict == null)
                 {
                     break;
                 }
 
-                error.Length = errorLengthBeforeSolve;
-
-                var removedPreference = false;
-                if (conflict.ClassIds != null && conflict.ClassIds.Count > 0)
+                if (RemoveClassPreferences(conflict, persistentClassPreferences))
                 {
-                    foreach (var classId in conflict.ClassIds)
-                    {
-                        if (persistentClassPreferences.Remove(classId))
-                        {
-                            removedPreference = true;
-                        }
-                    }
-                }
-
-                if (removedPreference)
-                {
+                    needTimeSolve = false;
                     continue;
                 }
 
+                needTimeSolve = true;
                 lastConflict = conflict;
 
                 if (!TryAddConflictCut(conflictCuts, conflictCutKeys, conflict))
@@ -173,6 +168,25 @@ namespace DTcms.Core.Common.Helpers
                 ? conflict.SubjectIds.OrderBy(id => id)
                 : Enumerable.Empty<int>();
             return $"{conflict.TimeIndex}:{string.Join(',', orderedSubjects)}";
+        }
+
+        private static bool RemoveClassPreferences(SlotTimeConflict conflict, Dictionary<int, ClassRoomPreference> persistentClassPreferences)
+        {
+            if (conflict.ClassIds == null || conflict.ClassIds.Count == 0)
+            {
+                return false;
+            }
+
+            var removed = false;
+            foreach (var classId in conflict.ClassIds)
+            {
+                if (persistentClassPreferences.Remove(classId))
+                {
+                    removed = true;
+                }
+            }
+
+            return removed;
         }
 
         #region 构建基础数据
@@ -885,11 +899,25 @@ namespace DTcms.Core.Common.Helpers
 
                 if (allocationResult == null)
                 {
+                    var impactedClasses = slotClassRequests
+                        .Where(r => classPreferences.ContainsKey(r.Class.Class.ModelClassId) || r.PreferredRooms.Count > 0)
+                        .Select(r => r.Class.Class.ModelClassId)
+                        .Distinct()
+                        .ToList();
+
+                    if (impactedClasses.Count == 0)
+                    {
+                        impactedClasses = slotClassRequests
+                            .Select(r => r.Class.Class.ModelClassId)
+                            .Distinct()
+                            .ToList();
+                    }
+
                     conflict = new SlotTimeConflict
                     {
                         TimeIndex = timeIndex,
                         SubjectIds = slotSubjects.Select(s => s.Subject.ModelSubjectId).Distinct().ToList(),
-                        ClassIds = slotClassRequests.Select(r => r.Class.Class.ModelClassId).Distinct().ToList()
+                        ClassIds = impactedClasses
                     };
                     return null;
                 }
@@ -974,6 +1002,11 @@ namespace DTcms.Core.Common.Helpers
 
                         roomEvent.TotalStudents += allocation.Students;
 
+                        if (!ValidateRoomGradeSharing(roomEvent, error))
+                        {
+                            return null;
+                        }
+
                         if (roomEvent.TotalStudents > roomEvent.Room.SeatCount)
                         {
                             error.AppendLine($"考场 {roomEvent.Room.Room.ModelRoomName ?? roomEvent.Room.RoomId.ToString()} 的学生数量超过座位容量。");
@@ -1043,6 +1076,28 @@ namespace DTcms.Core.Common.Helpers
                     ? new List<int>(preference.RoomIds)
                     : new List<int>()
             };
+        }
+
+        private static bool ValidateRoomGradeSharing(RoomEvent roomEvent, StringBuilder error)
+        {
+            var gradeSet = new HashSet<int>();
+            foreach (var share in roomEvent.ClassShares)
+            {
+                var grade = share.Class.Class.Grade;
+                if (!gradeSet.Add(grade))
+                {
+                    error.AppendLine($"考场 {roomEvent.Room.Room.ModelRoomName ?? roomEvent.Room.RoomId.ToString()} 在 {roomEvent.Slot.Date} {roomEvent.Slot.Start:HH:mm} 同时安排了相同年级的多个班级，违反排考规则。");
+                    return false;
+                }
+            }
+
+            if (gradeSet.Count > 2)
+            {
+                error.AppendLine($"考场 {roomEvent.Room.Room.ModelRoomName ?? roomEvent.Room.RoomId.ToString()} 在 {roomEvent.Slot.Date} {roomEvent.Slot.Start:HH:mm} 安排的班级超过两个年级，违反排考规则。");
+                return false;
+            }
+
+            return true;
         }
 
         private static bool ApplyRoomRelaxation(RoomRelaxationLevel level,
