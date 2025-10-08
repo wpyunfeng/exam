@@ -1998,7 +1998,6 @@ namespace DTcms.Core.Common.Helpers
                     }
 
                     var gap = Math.Max(0, config.MinExamInterval);
-                    var bigM = slotDuration + gap;
                     for (var a = 0; a < subjectVars.Count; a++)
                     {
                         for (var b = a + 1; b < subjectVars.Count; b++)
@@ -2011,19 +2010,25 @@ namespace DTcms.Core.Common.Helpers
                                 continue;
                             }
 
-                            var pairActive = cpModel.NewBoolVar($"room_{roomCandidates[j].Room.RoomId}_subjects_{subjectA}_{subjectB}_active");
-                            cpModel.Add(pairActive <= subjectVars[a].variable);
-                            cpModel.Add(pairActive <= subjectVars[b].variable);
-                            cpModel.Add(pairActive >= subjectVars[a].variable + subjectVars[b].variable - 1);
+                            var subjectVarA = subjectVars[a].variable;
+                            var subjectVarB = subjectVars[b].variable;
 
-                            var orderVar = cpModel.NewBoolVar($"room_{roomCandidates[j].Room.RoomId}_subjects_{subjectA}_{subjectB}_order");
-                            cpModel.Add(orderVar <= pairActive);
-                            cpModel.Add(orderVar == 0).OnlyEnforceIf(pairActive.Not());
+                            var aBeforeB = cpModel.NewBoolVar($"room_{roomCandidates[j].Room.RoomId}_subjects_{subjectA}_{subjectB}_a_before_b");
+                            var bBeforeA = cpModel.NewBoolVar($"room_{roomCandidates[j].Room.RoomId}_subjects_{subjectA}_{subjectB}_b_before_a");
 
-                            cpModel.Add(startVars[subjectA] + durations[subjectA] + gap <= startVars[subjectB] + bigM * (1 - orderVar))
-                                .OnlyEnforceIf(pairActive);
-                            cpModel.Add(startVars[subjectB] + durations[subjectB] + gap <= startVars[subjectA] + bigM * orderVar)
-                                .OnlyEnforceIf(pairActive);
+                            cpModel.Add(aBeforeB <= subjectVarA);
+                            cpModel.Add(aBeforeB <= subjectVarB);
+                            cpModel.Add(bBeforeA <= subjectVarA);
+                            cpModel.Add(bBeforeA <= subjectVarB);
+
+                            cpModel.Add(LinearExpr.Sum(new IntVar[] { aBeforeB, bBeforeA }) <= 1);
+                            cpModel.Add(LinearExpr.Sum(new IntVar[] { aBeforeB, bBeforeA }) >=
+                                LinearExpr.Sum(new IntVar[] { subjectVarA, subjectVarB }) - 1);
+
+                            cpModel.Add(startVars[subjectA] + durations[subjectA] + gap <= startVars[subjectB])
+                                .OnlyEnforceIf(aBeforeB);
+                            cpModel.Add(startVars[subjectB] + durations[subjectB] + gap <= startVars[subjectA])
+                                .OnlyEnforceIf(bBeforeA);
                         }
                     }
                 }
