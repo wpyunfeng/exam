@@ -75,6 +75,7 @@ namespace DTcms.Core.Common.Helpers
             Dictionary<int, int>? subjectTimeAssignments = null;
             SlotTimeConflict? lastConflict = null;
             var persistentClassPreferences = new Dictionary<int, ClassRoomPreference>();
+            var unscheduledSubjects = new Dictionary<int, UnscheduledSubjectInfo>();
 
             var maxIterations = (int)Math.Max(1, Math.Min(50L, Math.Max(1L, (long)Math.Max(1, subjects.Count) * Math.Max(1, timeSlots.Count))));
             var attempt = 0;
@@ -105,6 +106,7 @@ namespace DTcms.Core.Common.Helpers
 
                 if (conflict == null)
                 {
+                    RegisterAllUnscheduledSubjects(subjects, unscheduledSubjects, "因考场约束无法安排考试科目。");
                     break;
                 }
 
@@ -119,27 +121,39 @@ namespace DTcms.Core.Common.Helpers
 
                 if (!TryAddConflictCut(conflictCuts, conflictCutKeys, conflict))
                 {
+                    var removedSubjects = MarkSubjectsUnscheduled(conflict, subjects, timeSlots, unscheduledSubjects);
+                    if (removedSubjects.Count > 0)
+                    {
+                        if (subjectTimeAssignments != null)
+                        {
+                            foreach (var subjectId in removedSubjects)
+                            {
+                                subjectTimeAssignments.Remove(subjectId);
+                            }
+                        }
+
+                        needTimeSolve = true;
+                        continue;
+                    }
+
                     break;
                 }
             }
 
-            if (roomAssignments == null || subjectTimeAssignments == null)
+            if (roomAssignments == null)
             {
                 if (lastConflict != null)
                 {
-                    var slot = timeSlots[lastConflict.TimeIndex];
-                    var subjectNames = subjects
-                        .Where(s => lastConflict.SubjectIds.Contains(s.SubjectId))
-                        .Select(s => s.Subject.ModelSubjectName ?? s.SubjectId.ToString())
-                        .ToList();
-                    if (subjectNames.Count > 0)
-                    {
-                        error.AppendLine($"多次调整后仍无法在场次 {slot.Date} {slot.Start:HH:mm} 安排科目 {string.Join("、", subjectNames)} 的考场，请检查容量或规则设置。");
-                    }
+                    MarkSubjectsUnscheduled(lastConflict, subjects, timeSlots, unscheduledSubjects);
                 }
 
-                error.AppendLine("多次调整考试时间后仍无法满足考场约束，请检查排考数据是否存在冲突。");
-                throw new ResponseException(error.ToString(), ErrorCode.ParamError);
+                RegisterAllUnscheduledSubjects(subjects, unscheduledSubjects, "因考场约束无法安排考试科目。");
+                roomAssignments = new RoomAssignmentContainer();
+            }
+
+            if (subjectTimeAssignments == null)
+            {
+                subjectTimeAssignments = new Dictionary<int, int>();
             }
 
             var teacherAssignments = AssignTeachers(teachers, roomAssignments.RoomEvents, model, error);
@@ -148,7 +162,7 @@ namespace DTcms.Core.Common.Helpers
                 throw new ResponseException(error.ToString(), ErrorCode.ParamError);
             }
 
-            return BuildResults(roomAssignments, teacherAssignments);
+            return BuildResults(roomAssignments, teacherAssignments, unscheduledSubjects.Values);
 
         }
 
@@ -162,6 +176,135 @@ namespace DTcms.Core.Common.Helpers
 
             conflictCuts.Add(conflict);
             return true;
+        }
+
+        private static List<int> MarkSubjectsUnscheduled(
+            SlotTimeConflict conflict,
+            List<SubjectInfo> subjects,
+            List<TimeSlotInfo> timeSlots,
+            Dictionary<int, UnscheduledSubjectInfo> unscheduledSubjects)
+        {
+            var removedSubjects = new List<int>();
+
+            if (conflict.SubjectIds == null || conflict.SubjectIds.Count == 0)
+            {
+                return removedSubjects;
+            }
+
+            var slot = conflict.TimeIndex >= 0 && conflict.TimeIndex < timeSlots.Count
+                ? timeSlots[conflict.TimeIndex]
+                : null;
+
+            var classFilter = conflict.ClassIds != null && conflict.ClassIds.Count > 0
+                ? new HashSet<int>(conflict.ClassIds)
+                : null;
+
+            foreach (var subjectId in conflict.SubjectIds.Distinct())
+            {
+                var subject = subjects.FirstOrDefault(s => s.SubjectId == subjectId);
+                if (subject == null && unscheduledSubjects.TryGetValue(subjectId, out var cached))
+                {
+                    subject = cached.Subject;
+                }
+
+                if (subject == null)
+                {
+                    continue;
+                }
+
+                var subjectName = subject.Subject.ModelSubjectName ?? subject.SubjectId.ToString();
+                var reason = slot != null
+                    ? $"科目 {subjectName} 在 {slot.Date} {slot.Start:HH:mm} 因考场约束无法安排。"
+                    : $"科目 {subjectName} 因考场约束无法安排。";
+
+                var isNew = false;
+                if (!unscheduledSubjects.TryGetValue(subjectId, out var info))
+                {
+                    info = new UnscheduledSubjectInfo
+                    {
+                        Subject = subject,
+                        Reason = reason
+                    };
+                    unscheduledSubjects[subjectId] = info;
+                    isNew = true;
+                }
+                else if (string.IsNullOrWhiteSpace(info.Reason))
+                {
+                    info.Reason = reason;
+                }
+
+                var classesToAdd = subject.Classes;
+                if (classFilter != null && classFilter.Count > 0)
+                {
+                    var filtered = subject.Classes
+                        .Where(c => classFilter.Contains(c.Class.ModelClassId))
+                        .ToList();
+
+                    if (filtered.Count > 0)
+                    {
+                        classesToAdd = filtered;
+                    }
+                }
+
+                foreach (var cls in classesToAdd)
+                {
+                    if (!info.Classes.Contains(cls))
+                    {
+                        info.Classes.Add(cls);
+                    }
+                }
+
+                if (isNew)
+                {
+                    removedSubjects.Add(subjectId);
+                }
+            }
+
+            if (unscheduledSubjects.Count > 0)
+            {
+                subjects.RemoveAll(s => unscheduledSubjects.ContainsKey(s.SubjectId));
+            }
+
+            return removedSubjects;
+        }
+
+        private static void RegisterAllUnscheduledSubjects(
+            IEnumerable<SubjectInfo> subjects,
+            Dictionary<int, UnscheduledSubjectInfo> unscheduledSubjects,
+            string reason)
+        {
+            foreach (var subject in subjects)
+            {
+                if (subject == null)
+                {
+                    continue;
+                }
+
+                if (!unscheduledSubjects.TryGetValue(subject.SubjectId, out var info))
+                {
+                    info = new UnscheduledSubjectInfo
+                    {
+                        Subject = subject,
+                        Reason = reason
+                    };
+                    unscheduledSubjects[subject.SubjectId] = info;
+                }
+                else if (string.IsNullOrWhiteSpace(info.Reason))
+                {
+                    info.Reason = reason;
+                }
+
+                if (info.Classes.Count == 0)
+                {
+                    foreach (var cls in subject.Classes)
+                    {
+                        if (!info.Classes.Contains(cls))
+                        {
+                            info.Classes.Add(cls);
+                        }
+                    }
+                }
+            }
         }
 
         private static string BuildConflictCutKey(SlotTimeConflict conflict)
@@ -2704,7 +2847,8 @@ namespace DTcms.Core.Common.Helpers
         #endregion
 
         private static List<AIExamResult> BuildResults(RoomAssignmentContainer container,
-            Dictionary<(int timeIndex, int roomId, int subjectId), List<int>> teacherAssignments)
+            Dictionary<(int timeIndex, int roomId, int subjectId), List<int>> teacherAssignments,
+            IEnumerable<UnscheduledSubjectInfo> unscheduledSubjects)
         {
             var results = new List<AIExamResult>();
 
@@ -2734,6 +2878,7 @@ namespace DTcms.Core.Common.Helpers
                     EndTime = end.ToString("HH:mm"),
                     StudentCount = assignment.Students,
                     SeatCount = assignment.Room.SeatCount,
+                    IsAssigned = true,
                     TeacherList = teacherList.Select(id => new AIExamTeacherResult
                     {
                         ModelTeacherId = id
@@ -2741,11 +2886,44 @@ namespace DTcms.Core.Common.Helpers
                 });
             }
 
+            foreach (var unscheduled in unscheduledSubjects)
+            {
+                if (unscheduled == null)
+                {
+                    continue;
+                }
+
+                var classes = unscheduled.Classes != null && unscheduled.Classes.Count > 0
+                    ? unscheduled.Classes
+                    : unscheduled.Subject.Classes;
+
+                foreach (var cls in classes)
+                {
+                    results.Add(new AIExamResult
+                    {
+                        ModelSubjectId = unscheduled.Subject.SubjectId,
+                        ModelRoomId = 0,
+                        ModelClassId = cls.Class.ModelClassId,
+                        Duration = unscheduled.Subject.Duration,
+                        Date = null,
+                        StartTime = null,
+                        EndTime = null,
+                        StudentCount = cls.StudentCount,
+                        SeatCount = 0,
+                        IsAssigned = false,
+                        Message = unscheduled.Reason,
+                        TeacherList = new List<AIExamTeacherResult>()
+                    });
+                }
+            }
+
             return results
-                .OrderBy(r => r.Date)
-                .ThenBy(r => r.StartTime)
+                .OrderByDescending(r => r.IsAssigned)
+                .ThenBy(r => r.Date ?? string.Empty)
+                .ThenBy(r => r.StartTime ?? string.Empty)
                 .ThenBy(r => r.ModelRoomId)
                 .ThenBy(r => r.ModelClassId)
+                .ThenBy(r => r.ModelSubjectId)
                 .ToList();
         }
 
@@ -2874,6 +3052,13 @@ namespace DTcms.Core.Common.Helpers
             public Dictionary<(int timeIndex, int roomId), List<RoomEvent>> EventLookup { get; set; } = new Dictionary<(int timeIndex, int roomId), List<RoomEvent>>();
         }
 
+        private sealed class UnscheduledSubjectInfo
+        {
+            public SubjectInfo Subject { get; set; } = null!;
+            public List<ClassInfo> Classes { get; } = new List<ClassInfo>();
+            public string Reason { get; set; } = string.Empty;
+        }
+
         private sealed class SlotTimeConflict
         {
             public int TimeIndex { get; set; }
@@ -2899,6 +3084,8 @@ namespace DTcms.Core.Common.Helpers
         public int StudentCount { get; set; }
         public int SeatCount { get; set; }
         public List<AIExamTeacherResult> TeacherList { get; set; } = new List<AIExamTeacherResult>();
+        public bool IsAssigned { get; set; }
+        public string? Message { get; set; }
     }
 
     public class AIExamTeacherResult
