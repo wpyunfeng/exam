@@ -803,7 +803,7 @@ namespace DTcms.Core.Common.Helpers
                     conflict = new SlotTimeConflict
                     {
                         TimeIndex = timeIndex,
-                        SubjectIds = slotSubjects.Select(s => s.Subject.SubjectId).Distinct().ToList()
+                        SubjectIds = slotSubjects.Select(s => s.Subject.ModelSubjectId).Distinct().ToList()
                     };
                     return null;
                 }
