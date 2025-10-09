@@ -1674,6 +1674,156 @@ namespace DTcms.Core.Common.Helpers
             return true;
         }
 
+        private static bool ValidateRoomSchedules(
+            List<SubjectInfo> slotSubjects,
+            SlotRoomAllocationResult allocationResult,
+            TimeSlotInfo slot,
+            Dictionary<int, int> subjectOffsets,
+            AIExamConfig config,
+            out SlotTimeConflict? scheduleConflict)
+        {
+            scheduleConflict = null;
+
+            if (slotSubjects.Count == 0)
+            {
+                return true;
+            }
+
+            var subjectLookup = slotSubjects.ToDictionary(s => s.SubjectId, s => s);
+            var subjectRoomMap = new Dictionary<int, HashSet<int>>();
+
+            foreach (var kvp in allocationResult.ClassAllocations)
+            {
+                var subjectId = kvp.Key.subjectId;
+                if (!subjectRoomMap.TryGetValue(subjectId, out var rooms))
+                {
+                    rooms = new HashSet<int>();
+                    subjectRoomMap[subjectId] = rooms;
+                }
+
+                foreach (var allocation in kvp.Value)
+                {
+                    rooms.Add(allocation.Room.RoomId);
+                }
+            }
+
+            if (subjectRoomMap.Count == 0)
+            {
+                return true;
+            }
+
+            var roomSchedules = new Dictionary<int, List<RoomScheduleEntry>>();
+            var minGap = Math.Max(0, config.MinExamInterval);
+            var usageLimit = GetRoomUsageLimit(slot.TimeNo);
+
+            foreach (var subjectEntry in subjectRoomMap)
+            {
+                if (!subjectLookup.TryGetValue(subjectEntry.Key, out var subject))
+                {
+                    continue;
+                }
+
+                var duration = GetSubjectDurationForSlot(subject, slot);
+                if (duration <= 0)
+                {
+                    scheduleConflict = new SlotTimeConflict
+                    {
+                        TimeIndex = slot.Index,
+                        SubjectIds = new List<int> { subjectEntry.Key },
+                        ClassIds = CollectClassIdsForSubjects(allocationResult, subjectEntry.Key)
+                    };
+                    return false;
+                }
+
+                var offset = subjectOffsets.TryGetValue(subjectEntry.Key, out var offsetValue) ? offsetValue : 0;
+                if (offset < 0)
+                {
+                    scheduleConflict = new SlotTimeConflict
+                    {
+                        TimeIndex = slot.Index,
+                        SubjectIds = new List<int> { subjectEntry.Key },
+                        ClassIds = CollectClassIdsForSubjects(allocationResult, subjectEntry.Key)
+                    };
+                    return false;
+                }
+
+                var startTime = slot.Start.AddMinutes(offset);
+                var endTime = startTime.AddMinutes(duration);
+                if (startTime < slot.Start || endTime > slot.End)
+                {
+                    scheduleConflict = new SlotTimeConflict
+                    {
+                        TimeIndex = slot.Index,
+                        SubjectIds = new List<int> { subjectEntry.Key },
+                        ClassIds = CollectClassIdsForSubjects(allocationResult, subjectEntry.Key)
+                    };
+                    return false;
+                }
+
+                foreach (var roomId in subjectEntry.Value)
+                {
+                    if (!roomSchedules.TryGetValue(roomId, out var schedule))
+                    {
+                        schedule = new List<RoomScheduleEntry>();
+                        roomSchedules[roomId] = schedule;
+                    }
+
+                    var existingEntry = schedule.FirstOrDefault(e => e.SubjectId == subjectEntry.Key);
+                    if (existingEntry != null)
+                    {
+                        if (existingEntry.Offset != offset || existingEntry.Duration != duration)
+                        {
+                            scheduleConflict = new SlotTimeConflict
+                            {
+                                TimeIndex = slot.Index,
+                                SubjectIds = new List<int> { subjectEntry.Key },
+                                ClassIds = CollectClassIdsForSubjects(allocationResult, subjectEntry.Key)
+                            };
+                            return false;
+                        }
+                        continue;
+                    }
+
+                    if (usageLimit > 0 && schedule.Count >= usageLimit)
+                    {
+                        var involvedSubjects = schedule.Select(e => e.SubjectId).Append(subjectEntry.Key).Distinct().ToList();
+                        scheduleConflict = new SlotTimeConflict
+                        {
+                            TimeIndex = slot.Index,
+                            SubjectIds = involvedSubjects,
+                            ClassIds = CollectClassIdsForSubjects(allocationResult, involvedSubjects.ToArray())
+                        };
+                        return false;
+                    }
+
+                    foreach (var existing in schedule)
+                    {
+                        var existingStart = slot.Start.AddMinutes(existing.Offset);
+                        var existingEnd = existingStart.AddMinutes(existing.Duration);
+                        if (!HasSufficientGap(existingStart, existingEnd, startTime, endTime, minGap))
+                        {
+                            scheduleConflict = new SlotTimeConflict
+                            {
+                                TimeIndex = slot.Index,
+                                SubjectIds = new List<int> { subjectEntry.Key, existing.SubjectId }.Distinct().ToList(),
+                                ClassIds = CollectClassIdsForSubjects(allocationResult, subjectEntry.Key, existing.SubjectId)
+                            };
+                            return false;
+                        }
+                    }
+
+                    schedule.Add(new RoomScheduleEntry
+                    {
+                        SubjectId = subjectEntry.Key,
+                        Offset = offset,
+                        Duration = duration
+                    });
+                }
+            }
+
+            return true;
+        }
+
         private static Dictionary<int, int>? ComputeSubjectStartOffsets(
             List<SubjectInfo> slotSubjects,
             TimeSlotInfo slot,
