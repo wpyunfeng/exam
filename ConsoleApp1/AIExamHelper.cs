@@ -80,6 +80,7 @@ namespace DTcms.Core.Common.Helpers
             var roomSessionUsage = rooms.Keys.ToDictionary(x => x, _ => new Dictionary<int, int>());
             var classSchedules = classes.Keys.ToDictionary(x => x, _ => new List<ClassInterval>());
             var classDailyUsage = classes.Keys.ToDictionary(x => x, _ => new Dictionary<DateTime, int>());
+            var classRoomTemplates = classes.Keys.ToDictionary(x => x, _ => new List<RoomSeatAllocation>());
 
             var subjectStartMap = new Dictionary<int, DateTime>();
             var jointRules = BuildJointRules(model.RuleJointSubjectList);
@@ -115,6 +116,7 @@ namespace DTcms.Core.Common.Helpers
                         roomSessionUsage,
                         classSchedules,
                         classDailyUsage,
+                        classRoomTemplates,
                         subjectStartMap,
                         jointRules,
                         jointNotRules,
@@ -153,6 +155,7 @@ namespace DTcms.Core.Common.Helpers
             Dictionary<int, Dictionary<int, int>> roomSessionUsage,
             Dictionary<int, List<ClassInterval>> classSchedules,
             Dictionary<int, Dictionary<DateTime, int>> classDailyUsage,
+            Dictionary<int, List<RoomSeatAllocation>> classRoomTemplates,
             Dictionary<int, DateTime> subjectStartMap,
             List<JointRule> jointRules,
             List<JointNotRule> jointNotRules,
@@ -160,6 +163,78 @@ namespace DTcms.Core.Common.Helpers
             out string errorMessage)
         {
             subjectResults = new List<AIExamResult>();
+            errorMessage = string.Empty;
+
+            if (TryScheduleSubjectInternal(
+                    subject,
+                    subjectClasses,
+                    sessions,
+                    rooms,
+                    config,
+                    roomSchedules,
+                    roomSessionUsage,
+                    classSchedules,
+                    classDailyUsage,
+                    classRoomTemplates,
+                    subjectStartMap,
+                    jointRules,
+                    jointNotRules,
+                    allowRoomAdjustments: false,
+                    out subjectResults,
+                    out var allocation,
+                    out errorMessage))
+            {
+                EnsureClassRoomTemplates(classRoomTemplates, allocation);
+                return true;
+            }
+
+            if (TryScheduleSubjectInternal(
+                    subject,
+                    subjectClasses,
+                    sessions,
+                    rooms,
+                    config,
+                    roomSchedules,
+                    roomSessionUsage,
+                    classSchedules,
+                    classDailyUsage,
+                    classRoomTemplates,
+                    subjectStartMap,
+                    jointRules,
+                    jointNotRules,
+                    allowRoomAdjustments: true,
+                    out subjectResults,
+                    out allocation,
+                    out errorMessage))
+            {
+                EnsureClassRoomTemplates(classRoomTemplates, allocation);
+                return true;
+            }
+
+            return false;
+        }
+
+        private static bool TryScheduleSubjectInternal(
+            AIExamModelSubject subject,
+            List<AIExamModelClass> subjectClasses,
+            List<SessionInfo> sessions,
+            Dictionary<int, AIExamModelRoom> rooms,
+            AIExamConfig config,
+            Dictionary<int, List<RoomInterval>> roomSchedules,
+            Dictionary<int, Dictionary<int, int>> roomSessionUsage,
+            Dictionary<int, List<ClassInterval>> classSchedules,
+            Dictionary<int, Dictionary<DateTime, int>> classDailyUsage,
+            Dictionary<int, List<RoomSeatAllocation>> classRoomTemplates,
+            Dictionary<int, DateTime> subjectStartMap,
+            List<JointRule> jointRules,
+            List<JointNotRule> jointNotRules,
+            bool allowRoomAdjustments,
+            out List<AIExamResult> subjectResults,
+            out Dictionary<int, List<RoomSeatAllocation>> allocation,
+            out string errorMessage)
+        {
+            subjectResults = new List<AIExamResult>();
+            allocation = new Dictionary<int, List<RoomSeatAllocation>>();
             errorMessage = string.Empty;
 
             var duration = TimeSpan.FromMinutes(subject.Duration);
@@ -184,7 +259,7 @@ namespace DTcms.Core.Common.Helpers
 
                 foreach (var candidateStart in startCandidates)
                 {
-                    var key = $"{subject.ModelSubjectId}_{session.Index}_{candidateStart:yyyyMMddHHmm}";
+                    var key = $"{subject.ModelSubjectId}_{session.Index}_{candidateStart:yyyyMMddHHmm}_{allowRoomAdjustments}";
                     if (!conflictCuts.Add(key))
                     {
                         continue;
@@ -202,7 +277,7 @@ namespace DTcms.Core.Common.Helpers
                         continue;
                     }
 
-                    if (!IsClassAvailabilitySatisfied(subjectClasses, candidateStart, candidateEnd, config, classSchedules, classDailyUsage, out var classValidationMessage))
+                    if (!IsClassAvailabilitySatisfied(subjectClasses, candidateStart, candidateEnd, config, classSchedules, classDailyUsage, out var _))
                     {
                         continue;
                     }
@@ -216,6 +291,9 @@ namespace DTcms.Core.Common.Helpers
                             rooms,
                             roomSchedules,
                             roomSessionUsage,
+                            classRoomTemplates,
+                            allowRoomAdjustments,
+                            out var allocationResult,
                             out var tempResults))
                     {
                         continue;
@@ -246,6 +324,7 @@ namespace DTcms.Core.Common.Helpers
 
                     subjectStartMap[subject.ModelSubjectId] = candidateStart;
                     subjectResults = tempResults;
+                    allocation = allocationResult;
                     return true;
                 }
             }
@@ -264,9 +343,13 @@ namespace DTcms.Core.Common.Helpers
             Dictionary<int, AIExamModelRoom> rooms,
             Dictionary<int, List<RoomInterval>> roomSchedules,
             Dictionary<int, Dictionary<int, int>> roomSessionUsage,
+            Dictionary<int, List<RoomSeatAllocation>> classRoomTemplates,
+            bool allowRoomAdjustments,
+            out Dictionary<int, List<RoomSeatAllocation>> allocation,
             out List<AIExamResult> results)
         {
             results = new List<AIExamResult>();
+            allocation = new Dictionary<int, List<RoomSeatAllocation>>();
 
             var availableRooms = rooms.Values
                 .Where(r => string.IsNullOrWhiteSpace(subject.ExamMode) || string.Equals(r.ExamMode, subject.ExamMode, StringComparison.OrdinalIgnoreCase))
@@ -289,7 +372,13 @@ namespace DTcms.Core.Common.Helpers
 
             foreach (var cls in subjectClasses)
             {
-                var candidates = BuildClassRoomCandidates(cls, availableRooms);
+                classRoomTemplates.TryGetValue(cls.ModelClassId, out var templateRooms);
+                if (templateRooms != null && templateRooms.Count == 0)
+                {
+                    templateRooms = null;
+                }
+
+                var candidates = BuildClassRoomCandidates(cls, availableRooms, templateRooms, allowRoomAdjustments);
                 if (candidates.Count == 0)
                 {
                     return false;
@@ -399,8 +488,6 @@ namespace DTcms.Core.Common.Helpers
                 return false;
             }
 
-            var allocation = new Dictionary<int, List<RoomSeatAllocation>>();
-
             foreach (var cls in subjectClasses)
             {
                 if (!classCandidates.TryGetValue(cls.ModelClassId, out var candidates))
@@ -469,11 +556,33 @@ namespace DTcms.Core.Common.Helpers
             return true;
         }
 
-        private static List<RoomSequenceCandidate> BuildClassRoomCandidates(AIExamModelClass cls, List<AIExamModelRoom> rooms)
+        private static List<RoomSequenceCandidate> BuildClassRoomCandidates(
+            AIExamModelClass cls,
+            List<AIExamModelRoom> rooms,
+            List<RoomSeatAllocation>? template,
+            bool allowRoomAdjustments)
         {
             const int MaxRoomsPerClass = 6;
             var candidates = new List<RoomSequenceCandidate>();
             var seen = new HashSet<string>();
+
+            if (template != null && template.Count > 0)
+            {
+                var templateCandidate = BuildTemplateCandidate(cls, rooms, template);
+                if (templateCandidate != null)
+                {
+                    candidates.Add(templateCandidate);
+                    seen.Add(templateCandidate.GetKey());
+                    if (!allowRoomAdjustments)
+                    {
+                        return candidates;
+                    }
+                }
+                else if (!allowRoomAdjustments)
+                {
+                    return candidates;
+                }
+            }
 
             foreach (var buildingGroup in rooms.GroupBy(r => r.BuildingId))
             {
@@ -545,11 +654,81 @@ namespace DTcms.Core.Common.Helpers
             }
 
             return candidates
-                .OrderBy(c => c.Seats.Count)
+                .OrderBy(c => c.IsTemplate ? 0 : 1)
+                .ThenBy(c => c.Seats.Count)
                 .ThenBy(c => c.TotalCapacity - cls.StudentCount)
                 .ThenBy(c => c.Seats.Sum(s => s.RoomNo ?? int.MaxValue))
                 .ThenBy(c => c.Seats.Sum(s => s.RoomId))
                 .ToList();
+        }
+
+        private static RoomSequenceCandidate? BuildTemplateCandidate(
+            AIExamModelClass cls,
+            List<AIExamModelRoom> availableRooms,
+            List<RoomSeatAllocation> template)
+        {
+            var roomLookup = availableRooms.ToDictionary(r => r.ModelRoomId, r => r);
+            var seats = new List<RoomSeatAllocation>();
+
+            foreach (var seat in template)
+            {
+                if (!roomLookup.TryGetValue(seat.RoomId, out var room))
+                {
+                    return null;
+                }
+
+                if (seat.SeatCount <= 0 || seat.SeatCount > room.SeatCount)
+                {
+                    return null;
+                }
+
+                seats.Add(new RoomSeatAllocation
+                {
+                    ClassId = cls.ModelClassId,
+                    Grade = cls.Grade,
+                    RoomId = room.ModelRoomId,
+                    RoomNo = room.RoomNo,
+                    BuildingId = room.BuildingId,
+                    SeatCount = seat.SeatCount,
+                    RoomSeat = room.SeatCount
+                });
+            }
+
+            if (seats.Sum(x => x.SeatCount) != cls.StudentCount)
+            {
+                return null;
+            }
+
+            return seats.Count > 0 ? new RoomSequenceCandidate(seats, true) : null;
+        }
+
+        private static void EnsureClassRoomTemplates(
+            Dictionary<int, List<RoomSeatAllocation>> classRoomTemplates,
+            Dictionary<int, List<RoomSeatAllocation>> allocation)
+        {
+            foreach (var pair in allocation)
+            {
+                if (!classRoomTemplates.TryGetValue(pair.Key, out var existing) || existing.Count == 0)
+                {
+                    classRoomTemplates[pair.Key] = pair.Value
+                        .Select(CloneSeatAllocation)
+                        .ToList();
+                }
+            }
+        }
+
+        private static RoomSeatAllocation CloneSeatAllocation(RoomSeatAllocation seat)
+        {
+            return new RoomSeatAllocation
+            {
+                ClassId = seat.ClassId,
+                Grade = seat.Grade,
+                RoomId = seat.RoomId,
+                RoomNo = seat.RoomNo,
+                BuildingId = seat.BuildingId,
+                SeatCount = seat.SeatCount,
+                RoomSeat = seat.RoomSeat
+            };
         }
 
         private static Dictionary<int, int>? DistributeStudentsEvenly(int studentCount, List<AIExamModelRoom> sequence)
@@ -1045,14 +1224,21 @@ namespace DTcms.Core.Common.Helpers
 
         private class RoomSequenceCandidate
         {
-            public RoomSequenceCandidate(List<RoomSeatAllocation> seats)
+            private readonly string _key;
+
+            public RoomSequenceCandidate(List<RoomSeatAllocation> seats, bool isTemplate = false)
             {
                 Seats = seats;
                 TotalCapacity = seats.Sum(x => x.RoomSeat);
+                IsTemplate = isTemplate;
+                _key = string.Join("-", seats.Select(x => x.RoomId));
             }
 
             public List<RoomSeatAllocation> Seats { get; }
             public int TotalCapacity { get; }
+            public bool IsTemplate { get; }
+
+            public string GetKey() => _key;
         }
 
         private class RoomSeatAllocation
