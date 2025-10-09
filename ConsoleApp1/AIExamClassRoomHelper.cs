@@ -38,6 +38,14 @@ namespace DTcms.Core.Common.Helpers
                 throw new InvalidOperationException("No rooms available for allocation.");
             }
 
+            var totalStudents = classes.Sum(c => c.StudentCount);
+            var totalSeats = rooms.Sum(r => r.SeatCount);
+
+            if (totalSeats < totalStudents)
+            {
+                throw new InvalidOperationException($"Insufficient total seating capacity: required {totalStudents}, available {totalSeats}.");
+            }
+
             // Maintain deterministic ordering based on provided list order for classes.
             var orderedClasses = classes.ToList();
 
