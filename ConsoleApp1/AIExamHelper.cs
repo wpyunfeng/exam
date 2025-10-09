@@ -216,9 +216,6 @@ namespace DTcms.Core.Common.Helpers
                             rooms,
                             roomSchedules,
                             roomSessionUsage,
-                            classSchedules,
-                            classDailyUsage,
-                            config,
                             out var tempResults))
                     {
                         continue;
@@ -257,6 +254,7 @@ namespace DTcms.Core.Common.Helpers
             return false;
         }
 
+
         private static bool TryAllocateRooms(
             AIExamModelSubject subject,
             List<AIExamModelClass> subjectClasses,
@@ -266,9 +264,6 @@ namespace DTcms.Core.Common.Helpers
             Dictionary<int, AIExamModelRoom> rooms,
             Dictionary<int, List<RoomInterval>> roomSchedules,
             Dictionary<int, Dictionary<int, int>> roomSessionUsage,
-            Dictionary<int, List<ClassInterval>> classSchedules,
-            Dictionary<int, Dictionary<DateTime, int>> classDailyUsage,
-            AIExamConfig config,
             out List<AIExamResult> results)
         {
             results = new List<AIExamResult>();
@@ -276,8 +271,8 @@ namespace DTcms.Core.Common.Helpers
             var availableRooms = rooms.Values
                 .Where(r => string.IsNullOrWhiteSpace(subject.ExamMode) || string.Equals(r.ExamMode, subject.ExamMode, StringComparison.OrdinalIgnoreCase))
                 .Where(r => IsRoomAvailable(r.ModelRoomId, start, end, session, roomSchedules, roomSessionUsage))
-                .OrderBy(r => r.SeatCount)
-                .ThenBy(r => r.Priority)
+                .OrderBy(r => r.Priority)
+                .ThenBy(r => r.SeatCount)
                 .ThenBy(r => r.RoomNo ?? int.MaxValue)
                 .ToList();
 
@@ -286,48 +281,318 @@ namespace DTcms.Core.Common.Helpers
                 return false;
             }
 
-            var tempRoomSchedules = CloneRoomSchedules(roomSchedules);
-            var tempRoomSessionUsage = CloneRoomSessionUsage(roomSessionUsage);
-            var tempResults = new List<AIExamResult>();
+            var model = new CpModel();
+            var assignVars = new Dictionary<(int ClassId, int RoomId), IntVar>();
+            var useVars = new Dictionary<(int ClassId, int RoomId), BoolVar>();
+            var buildingVars = new Dictionary<(int ClassId, int BuildingId), BoolVar>();
 
             foreach (var cls in subjectClasses)
             {
-                var allocation = FindRoomAllocationForClass(cls, availableRooms, subject.ExamMode);
-                if (allocation == null || allocation.Rooms.Count == 0)
+                var classRooms = availableRooms;
+                if (classRooms.Count == 0)
                 {
                     return false;
                 }
 
-                var assignedStudents = DistributeStudents(cls.StudentCount, allocation.Rooms.Count);
-                for (var i = 0; i < allocation.Rooms.Count; i++)
+                var buildingIds = classRooms.Select(r => r.BuildingId).Distinct().ToList();
+                foreach (var buildingId in buildingIds)
                 {
-                    var room = allocation.Rooms[i];
-                    var seats = assignedStudents[i];
+                    var buildingVar = model.NewBoolVar($"class_{cls.ModelClassId}_building_{buildingId}");
+                    buildingVars[(cls.ModelClassId, buildingId)] = buildingVar;
+                }
 
-                    if (seats > room.SeatCount)
+                model.Add(LinearExpr.Sum(buildingIds.Select(id => buildingVars[(cls.ModelClassId, id)])) == 1);
+
+                foreach (var room in classRooms)
+                {
+                    var assignVar = model.NewIntVar(0, cls.StudentCount, $"assign_c{cls.ModelClassId}_r{room.ModelRoomId}");
+                    var useVar = model.NewBoolVar($"use_c{cls.ModelClassId}_r{room.ModelRoomId}");
+
+                    assignVars[(cls.ModelClassId, room.ModelRoomId)] = assignVar;
+                    useVars[(cls.ModelClassId, room.ModelRoomId)] = useVar;
+
+                    model.Add(assignVar <= cls.StudentCount * useVar);
+                    model.Add(assignVar >= useVar);
+                    model.Add(useVar <= buildingVars[(cls.ModelClassId, room.BuildingId)]);
+                }
+
+                model.Add(LinearExpr.Sum(classRooms.Select(room => assignVars[(cls.ModelClassId, room.ModelRoomId)])) == cls.StudentCount);
+
+                var roomIds = classRooms.Select(room => room.ModelRoomId).ToList();
+                for (var i = 0; i < roomIds.Count; i++)
+                {
+                    for (var j = i + 1; j < roomIds.Count; j++)
                     {
-                        return false;
+                        var roomIdA = roomIds[i];
+                        var roomIdB = roomIds[j];
+                        var diff = model.NewIntVar(-cls.StudentCount, cls.StudentCount, $"diff_c{cls.ModelClassId}_r{roomIdA}_{roomIdB}");
+                        model.Add(diff == assignVars[(cls.ModelClassId, roomIdA)] - assignVars[(cls.ModelClassId, roomIdB)]);
+
+                        var useA = useVars[(cls.ModelClassId, roomIdA)];
+                        var useB = useVars[(cls.ModelClassId, roomIdB)];
+                        var bothUsed = model.NewBoolVar($"both_c{cls.ModelClassId}_r{roomIdA}_{roomIdB}");
+                        model.Add(bothUsed <= useA);
+                        model.Add(bothUsed <= useB);
+                        model.Add(bothUsed >= useA + useB - 1);
+
+                        model.Add(diff <= 1).OnlyEnforceIf(bothUsed);
+                        model.Add(diff >= -1).OnlyEnforceIf(bothUsed);
+                    }
+                }
+            }
+
+            var grades = subjectClasses.Select(c => c.Grade).Distinct().ToList();
+            var gradeUsedVars = new Dictionary<(int RoomId, int Grade), BoolVar>();
+
+            foreach (var room in availableRooms)
+            {
+                var classAssignments = subjectClasses
+                    .Select(cls => assignVars[(cls.ModelClassId, room.ModelRoomId)])
+                    .ToList();
+                model.Add(LinearExpr.Sum(classAssignments) <= room.SeatCount);
+
+                var gradeIndicators = new List<BoolVar>();
+                foreach (var grade in grades)
+                {
+                    var gradeVar = model.NewBoolVar($"room_{room.ModelRoomId}_grade_{grade}");
+                    gradeUsedVars[(room.ModelRoomId, grade)] = gradeVar;
+                    var gradeUseVars = subjectClasses
+                        .Where(cls => cls.Grade == grade)
+                        .Select(cls => useVars[(cls.ModelClassId, room.ModelRoomId)])
+                        .ToList();
+
+                    if (gradeUseVars.Count == 0)
+                    {
+                        model.Add(gradeVar == 0);
+                        continue;
                     }
 
-                    tempRoomSchedules[room.ModelRoomId].Add(new RoomInterval(start, end, session.Index, cls.Grade));
-
-                    if (!tempRoomSessionUsage[room.ModelRoomId].ContainsKey(session.Index))
+                    foreach (var useVar in gradeUseVars)
                     {
-                        tempRoomSessionUsage[room.ModelRoomId][session.Index] = 0;
+                        model.Add(useVar <= gradeVar);
                     }
 
-                    tempRoomSessionUsage[room.ModelRoomId][session.Index]++;
+                    model.Add(LinearExpr.Sum(gradeUseVars) <= 1);
+                    model.Add(gradeVar <= LinearExpr.Sum(gradeUseVars));
+                    gradeIndicators.Add(gradeVar);
+                }
 
-                    availableRooms.Remove(room);
+                if (gradeIndicators.Count > 0)
+                {
+                    model.Add(LinearExpr.Sum(gradeIndicators) <= 2);
+                }
+            }
 
-                    tempResults.Add(new AIExamResult
+            var wasteVars = new List<IntVar>();
+            foreach (var room in availableRooms)
+            {
+                var seatUsage = LinearExpr.Sum(subjectClasses.Select(cls => assignVars[(cls.ModelClassId, room.ModelRoomId)]));
+                var wasteVar = model.NewIntVar(0, room.SeatCount, $"waste_room_{room.ModelRoomId}");
+                model.Add(wasteVar == room.SeatCount - seatUsage);
+                wasteVars.Add(wasteVar);
+            }
+
+            model.Minimize(LinearExpr.Sum(wasteVars));
+
+            const int maxAttempts = 10;
+            for (var attempt = 0; attempt < maxAttempts; attempt++)
+            {
+                var solver = new CpSolver
+                {
+                    StringParameters = "max_time_in_seconds:30,num_search_workers:8"
+                };
+
+                var status = solver.Solve(model);
+                if (status != CpSolverStatus.Feasible && status != CpSolverStatus.Optimal)
+                {
+                    return false;
+                }
+
+                var allocation = ExtractAllocation(subjectClasses, availableRooms, solver, assignVars, useVars, rooms);
+                var adjacencyCuts = ValidateAdjacency(allocation);
+
+                if (adjacencyCuts.Count == 0)
+                {
+                    results = BuildResults(subject, start, end, allocation);
+
+                    foreach (var classAllocation in allocation)
+                    {
+                        foreach (var seat in classAllocation.Value)
+                        {
+                            if (!roomSchedules.TryGetValue(seat.RoomId, out var schedule))
+                            {
+                                schedule = new List<RoomInterval>();
+                                roomSchedules[seat.RoomId] = schedule;
+                            }
+
+                            schedule.Add(new RoomInterval(start, end, session.Index, seat.Grade));
+                        }
+                    }
+
+                    var usedRooms = allocation.SelectMany(x => x.Value.Select(v => v.RoomId)).Distinct();
+                    foreach (var roomId in usedRooms)
+                    {
+                        if (!roomSessionUsage.TryGetValue(roomId, out var usage))
+                        {
+                            usage = new Dictionary<int, int>();
+                            roomSessionUsage[roomId] = usage;
+                        }
+
+                        if (!usage.ContainsKey(session.Index))
+                        {
+                            usage[session.Index] = 0;
+                        }
+
+                        usage[session.Index]++;
+                    }
+
+                    return true;
+                }
+
+                foreach (var cut in adjacencyCuts)
+                {
+                    var vars = cut.RoomIds.Select(roomId => useVars[(cut.ClassId, roomId)]).ToList();
+                    if (vars.Count == 0)
+                    {
+                        continue;
+                    }
+
+                    model.Add(LinearExpr.Sum(vars) <= vars.Count - 1);
+                }
+            }
+
+            return false;
+        }
+
+        private static Dictionary<int, List<RoomSeatAllocation>> ExtractAllocation(
+            List<AIExamModelClass> subjectClasses,
+            List<AIExamModelRoom> rooms,
+            CpSolver solver,
+            Dictionary<(int ClassId, int RoomId), IntVar> assignVars,
+            Dictionary<(int ClassId, int RoomId), BoolVar> useVars,
+            Dictionary<int, AIExamModelRoom> roomLookup)
+        {
+            var allocation = new Dictionary<int, List<RoomSeatAllocation>>();
+
+            foreach (var cls in subjectClasses)
+            {
+                var seats = new List<RoomSeatAllocation>();
+
+                foreach (var room in rooms)
+                {
+                    var useVar = useVars[(cls.ModelClassId, room.ModelRoomId)];
+                    if (solver.Value(useVar) < 0.5)
+                    {
+                        continue;
+                    }
+
+                    var seatVar = assignVars[(cls.ModelClassId, room.ModelRoomId)];
+                    var seatCount = (int)solver.Value(seatVar);
+                    if (seatCount <= 0)
+                    {
+                        continue;
+                    }
+
+                    var roomInfo = roomLookup[room.ModelRoomId];
+                    seats.Add(new RoomSeatAllocation
+                    {
+                        ClassId = cls.ModelClassId,
+                        Grade = cls.Grade,
+                        RoomId = room.ModelRoomId,
+                        RoomNo = roomInfo.RoomNo,
+                        BuildingId = roomInfo.BuildingId,
+                        SeatCount = seatCount,
+                        RoomSeat = roomInfo.SeatCount
+                    });
+                }
+
+                allocation[cls.ModelClassId] = seats;
+            }
+
+            return allocation;
+        }
+
+        private static List<AdjacencyCut> ValidateAdjacency(
+            Dictionary<int, List<RoomSeatAllocation>> allocation)
+        {
+            var cuts = new List<AdjacencyCut>();
+
+            foreach (var entry in allocation)
+            {
+                var classRooms = entry.Value;
+                if (classRooms.Count <= 1)
+                {
+                    continue;
+                }
+
+                var buildingGroups = classRooms.GroupBy(x => x.BuildingId).ToList();
+                if (buildingGroups.Count != 1)
+                {
+                    cuts.Add(new AdjacencyCut
+                    {
+                        ClassId = entry.Key,
+                        RoomIds = classRooms.Select(x => x.RoomId).ToList()
+                    });
+                    continue;
+                }
+
+                if (!AreRoomsContiguous(classRooms))
+                {
+                    cuts.Add(new AdjacencyCut
+                    {
+                        ClassId = entry.Key,
+                        RoomIds = classRooms.Select(x => x.RoomId).ToList()
+                    });
+                }
+            }
+
+            return cuts;
+        }
+
+        private static bool AreRoomsContiguous(List<RoomSeatAllocation> rooms)
+        {
+            if (rooms.Count <= 1)
+            {
+                return true;
+            }
+
+            if (rooms.Any(r => !r.RoomNo.HasValue))
+            {
+                return true;
+            }
+
+            var ordered = rooms.OrderBy(r => r.RoomNo!.Value).ToList();
+            for (var i = 1; i < ordered.Count; i++)
+            {
+                if (Math.Abs(ordered[i].RoomNo!.Value - ordered[i - 1].RoomNo!.Value) > 1)
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        private static List<AIExamResult> BuildResults(
+            AIExamModelSubject subject,
+            DateTime start,
+            DateTime end,
+            Dictionary<int, List<RoomSeatAllocation>> allocation)
+        {
+            var list = new List<AIExamResult>();
+
+            foreach (var entry in allocation)
+            {
+                foreach (var seat in entry.Value)
+                {
+                    list.Add(new AIExamResult
                     {
                         ModelSubjectId = subject.ModelSubjectId,
-                        ModelClassId = cls.ModelClassId,
-                        ModelRoomId = room.ModelRoomId,
+                        ModelClassId = entry.Key,
+                        ModelRoomId = seat.RoomId,
                         Duration = subject.Duration,
-                        StudentCount = seats,
-                        SeatCount = room.SeatCount,
+                        StudentCount = seat.SeatCount,
+                        SeatCount = seat.RoomSeat,
                         Date = start.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
                         StartTime = start.ToString("HH:mm", CultureInfo.InvariantCulture),
                         EndTime = end.ToString("HH:mm", CultureInfo.InvariantCulture)
@@ -335,122 +600,7 @@ namespace DTcms.Core.Common.Helpers
                 }
             }
 
-            roomSchedules.Clear();
-            foreach (var kvp in tempRoomSchedules)
-            {
-                roomSchedules[kvp.Key] = kvp.Value;
-            }
-
-            roomSessionUsage.Clear();
-            foreach (var kvp in tempRoomSessionUsage)
-            {
-                roomSessionUsage[kvp.Key] = kvp.Value;
-            }
-
-            results = tempResults;
-            return true;
-        }
-
-        private static RoomAllocation? FindRoomAllocationForClass(AIExamModelClass cls, List<AIExamModelRoom> availableRooms, string? examMode)
-        {
-            if (availableRooms.Count == 0)
-            {
-                return null;
-            }
-
-            var best = FindBestAllocation(cls.StudentCount, availableRooms, requireAdjacency: true);
-            if (best == null)
-            {
-                best = FindBestAllocation(cls.StudentCount, availableRooms, requireAdjacency: false);
-            }
-
-            return best;
-        }
-
-        private static RoomAllocation? FindBestAllocation(int studentCount, List<AIExamModelRoom> availableRooms, bool requireAdjacency)
-        {
-            RoomAllocation? best = null;
-
-            foreach (var group in availableRooms.GroupBy(r => r.BuildingId))
-            {
-                var orderedRooms = group
-                    .OrderBy(r => r.RoomNo ?? int.MaxValue)
-                    .ThenBy(r => r.SeatCount)
-                    .ToList();
-
-                if (!requireAdjacency)
-                {
-                    orderedRooms = orderedRooms
-                        .OrderBy(r => Math.Max(0, r.SeatCount - studentCount))
-                        .ThenBy(r => r.SeatCount)
-                        .ToList();
-                }
-
-                for (var i = 0; i < orderedRooms.Count; i++)
-                {
-                    var combination = new List<AIExamModelRoom>();
-                    var totalSeats = 0;
-
-                    for (var j = i; j < orderedRooms.Count; j++)
-                    {
-                        if (requireAdjacency && combination.Count > 0)
-                        {
-                            if (!AreRoomsAdjacent(combination.Last(), orderedRooms[j]))
-                            {
-                                break;
-                            }
-                        }
-
-                        combination.Add(orderedRooms[j]);
-                        totalSeats += orderedRooms[j].SeatCount;
-
-                        if (totalSeats >= studentCount)
-                        {
-                            var waste = totalSeats - studentCount;
-                            if (best == null || waste < best.SeatWaste ||
-                                (waste == best.SeatWaste && totalSeats < best.TotalSeat) ||
-                                (waste == best.SeatWaste && totalSeats == best.TotalSeat && combination.Count < best.Rooms.Count))
-                            {
-                                best = new RoomAllocation
-                                {
-                                    Rooms = new List<AIExamModelRoom>(combination),
-                                    SeatWaste = waste,
-                                    TotalSeat = totalSeats
-                                };
-                            }
-
-                            break;
-                        }
-                    }
-                }
-            }
-
-            return best;
-        }
-
-        private static bool AreRoomsAdjacent(AIExamModelRoom previous, AIExamModelRoom next)
-        {
-            if (previous.RoomNo.HasValue && next.RoomNo.HasValue)
-            {
-                return Math.Abs(previous.RoomNo.Value - next.RoomNo.Value) <= 1;
-            }
-
-            return true;
-        }
-
-        private static List<int> DistributeStudents(int totalStudents, int roomCount)
-        {
-            var distribution = new List<int>();
-            var remaining = totalStudents;
-
-            for (var i = roomCount; i > 0; i--)
-            {
-                var allocation = (int)Math.Ceiling((double)remaining / i);
-                distribution.Add(allocation);
-                remaining -= allocation;
-            }
-
-            return distribution;
+            return list;
         }
 
         private static bool IsRoomAvailable(
@@ -562,20 +712,6 @@ namespace DTcms.Core.Common.Helpers
         private static bool IsOverlapping(DateTime start1, DateTime end1, DateTime start2, DateTime end2)
         {
             return start1 < end2 && start2 < end1;
-        }
-
-        private static Dictionary<int, List<RoomInterval>> CloneRoomSchedules(Dictionary<int, List<RoomInterval>> source)
-        {
-            return source.ToDictionary(
-                kvp => kvp.Key,
-                kvp => kvp.Value.Select(x => new RoomInterval(x.Start, x.End, x.SessionIndex, x.Grade)).ToList());
-        }
-
-        private static Dictionary<int, Dictionary<int, int>> CloneRoomSessionUsage(Dictionary<int, Dictionary<int, int>> source)
-        {
-            return source.ToDictionary(
-                kvp => kvp.Key,
-                kvp => kvp.Value.ToDictionary(x => x.Key, x => x.Value));
         }
 
         private static List<SessionCandidate> GetCandidateSessions(
@@ -840,11 +976,21 @@ namespace DTcms.Core.Common.Helpers
             public int SubjectId { get; }
         }
 
-        private class RoomAllocation
+        private class RoomSeatAllocation
         {
-            public List<AIExamModelRoom> Rooms { get; set; } = new List<AIExamModelRoom>();
-            public int SeatWaste { get; set; }
-            public int TotalSeat { get; set; }
+            public int ClassId { get; set; }
+            public int Grade { get; set; }
+            public int RoomId { get; set; }
+            public int? RoomNo { get; set; }
+            public int BuildingId { get; set; }
+            public int SeatCount { get; set; }
+            public int RoomSeat { get; set; }
+        }
+
+        private class AdjacencyCut
+        {
+            public int ClassId { get; set; }
+            public List<int> RoomIds { get; set; } = new List<int>();
         }
 
         private class JointRule
