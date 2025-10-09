@@ -282,89 +282,99 @@ namespace DTcms.Core.Common.Helpers
             }
 
             var model = new CpModel();
-            var useVars = new Dictionary<(int ClassId, int RoomId), BoolVar>();
-            var classCandidates = new Dictionary<int, List<AIExamModelRoom>>();
-            var roomCandidateClasses = new Dictionary<int, List<AIExamModelClass>>();
+            var classCandidates = new Dictionary<int, List<RoomSequenceCandidate>>();
+            var assignmentVars = new Dictionary<(int ClassId, int CandidateIndex), BoolVar>();
+            var roomUsageTerms = new Dictionary<int, List<(BoolVar Var, int StudentCount)>>();
+            var roomGradeAssignments = new Dictionary<(int RoomId, int Grade), List<BoolVar>>();
 
             foreach (var cls in subjectClasses)
             {
-                var classRooms = availableRooms
-                    .Where(r => r.SeatCount >= cls.StudentCount)
-                    .ToList();
-
-                if (classRooms.Count == 0)
+                var candidates = BuildClassRoomCandidates(cls, availableRooms);
+                if (candidates.Count == 0)
                 {
                     return false;
                 }
 
-                classCandidates[cls.ModelClassId] = classRooms;
+                classCandidates[cls.ModelClassId] = candidates;
 
-                var classRoomVars = new List<BoolVar>();
-                foreach (var room in classRooms)
+                var classVars = new List<BoolVar>();
+
+                for (var i = 0; i < candidates.Count; i++)
                 {
-                    var useVar = model.NewBoolVar($"assign_c{cls.ModelClassId}_r{room.ModelRoomId}");
-                    useVars[(cls.ModelClassId, room.ModelRoomId)] = useVar;
-                    classRoomVars.Add(useVar);
+                    var candidate = candidates[i];
+                    var varName = $"assign_c{cls.ModelClassId}_cand{i}";
+                    var assignVar = model.NewBoolVar(varName);
+                    assignmentVars[(cls.ModelClassId, i)] = assignVar;
+                    classVars.Add(assignVar);
 
-                    if (!roomCandidateClasses.TryGetValue(room.ModelRoomId, out var list))
+                    foreach (var seat in candidate.Seats)
                     {
-                        list = new List<AIExamModelClass>();
-                        roomCandidateClasses[room.ModelRoomId] = list;
-                    }
+                        if (!roomUsageTerms.TryGetValue(seat.RoomId, out var usageList))
+                        {
+                            usageList = new List<(BoolVar Var, int StudentCount)>();
+                            roomUsageTerms[seat.RoomId] = usageList;
+                        }
 
-                    list.Add(cls);
+                        usageList.Add((assignVar, seat.SeatCount));
+
+                        var gradeKey = (seat.RoomId, cls.Grade);
+                        if (!roomGradeAssignments.TryGetValue(gradeKey, out var gradeList))
+                        {
+                            gradeList = new List<BoolVar>();
+                            roomGradeAssignments[gradeKey] = gradeList;
+                        }
+
+                        gradeList.Add(assignVar);
+                    }
                 }
 
-                model.Add(LinearExpr.Sum(classRoomVars) == 1);
+                model.Add(LinearExpr.Sum(classVars) == 1);
             }
 
             var wasteVars = new List<IntVar>();
 
             foreach (var room in availableRooms)
             {
-                if (!roomCandidateClasses.TryGetValue(room.ModelRoomId, out var candidateClasses) || candidateClasses.Count == 0)
+                if (!roomUsageTerms.TryGetValue(room.ModelRoomId, out var usages))
                 {
                     continue;
                 }
 
-                var classUseVars = candidateClasses
-                    .Select(cls => useVars[(cls.ModelClassId, room.ModelRoomId)])
-                    .ToList();
-
                 var seatUsage = model.NewIntVar(0, room.SeatCount, $"seat_usage_room_{room.ModelRoomId}");
-                model.Add(seatUsage == LinearExpr.Sum(candidateClasses.Select(cls => LinearExpr.Term(useVars[(cls.ModelClassId, room.ModelRoomId)], cls.StudentCount))));
-                model.Add(seatUsage <= room.SeatCount);
+                var seatTerms = usages.Select(u => LinearExpr.Term(u.Var, u.StudentCount)).ToList();
+                model.Add(seatUsage == LinearExpr.Sum(seatTerms));
 
                 var roomUsed = model.NewBoolVar($"room_used_{room.ModelRoomId}");
-                foreach (var useVar in classUseVars)
-                {
-                    model.Add(useVar <= roomUsed);
-                }
-
-                model.Add(roomUsed <= LinearExpr.Sum(classUseVars));
+                model.Add(seatUsage <= room.SeatCount * roomUsed);
+                model.Add(seatUsage >= roomUsed);
 
                 var wasteVar = model.NewIntVar(0, room.SeatCount, $"waste_room_{room.ModelRoomId}");
-                model.Add(LinearExpr.Sum(new LinearExpr[] { wasteVar, seatUsage }) == LinearExpr.Term(roomUsed, room.SeatCount));
+                model.Add(seatUsage + wasteVar == room.SeatCount * roomUsed);
                 wasteVars.Add(wasteVar);
 
-                var gradeGroups = candidateClasses.GroupBy(cls => cls.Grade).ToList();
                 var gradeVars = new List<BoolVar>();
+                var gradesInRoom = roomGradeAssignments
+                    .Where(kvp => kvp.Key.RoomId == room.ModelRoomId)
+                    .Select(kvp => (Grade: kvp.Key.Grade, Vars: kvp.Value))
+                    .ToList();
 
-                foreach (var gradeGroup in gradeGroups)
+                foreach (var (grade, gradeVarList) in gradesInRoom)
                 {
-                    var gradeVar = model.NewBoolVar($"room_{room.ModelRoomId}_grade_{gradeGroup.Key}");
-                    gradeVars.Add(gradeVar);
-
-                    var gradeUseVars = gradeGroup
-                        .Select(cls => useVars[(cls.ModelClassId, room.ModelRoomId)])
-                        .ToList();
-
-                    foreach (var useVar in gradeUseVars)
+                    if (gradeVarList.Count == 0)
                     {
-                        model.Add(useVar <= gradeVar);
+                        continue;
                     }
 
-                    model.Add(gradeVar <= LinearExpr.Sum(gradeUseVars));
+                    model.Add(LinearExpr.Sum(gradeVarList) <= 1);
+
+                    var gradeIndicator = model.NewBoolVar($"room_{room.ModelRoomId}_grade_{grade}");
+                    foreach (var assignVar in gradeVarList)
+                    {
+                        model.Add(assignVar <= gradeIndicator);
+                    }
+
+                    model.Add(gradeIndicator <= LinearExpr.Sum(gradeVarList));
+                    gradeVars.Add(gradeIndicator);
                 }
 
                 if (gradeVars.Count > 0)
@@ -393,39 +403,38 @@ namespace DTcms.Core.Common.Helpers
 
             foreach (var cls in subjectClasses)
             {
-                if (!classCandidates.TryGetValue(cls.ModelClassId, out var candidateRooms))
+                if (!classCandidates.TryGetValue(cls.ModelClassId, out var candidates))
                 {
                     return false;
                 }
 
-                AIExamModelRoom? assignedRoom = null;
-                foreach (var room in candidateRooms)
+                RoomSequenceCandidate? selected = null;
+                for (var i = 0; i < candidates.Count; i++)
                 {
-                    if (solver.Value(useVars[(cls.ModelClassId, room.ModelRoomId)]) > 0.5)
+                    if (solver.Value(assignmentVars[(cls.ModelClassId, i)]) > 0.5)
                     {
-                        assignedRoom = room;
+                        selected = candidates[i];
                         break;
                     }
                 }
 
-                if (assignedRoom == null)
+                if (selected == null)
                 {
                     return false;
                 }
 
-                allocation[cls.ModelClassId] = new List<RoomSeatAllocation>
-                {
-                    new RoomSeatAllocation
+                allocation[cls.ModelClassId] = selected.Seats
+                    .Select(seat => new RoomSeatAllocation
                     {
                         ClassId = cls.ModelClassId,
                         Grade = cls.Grade,
-                        RoomId = assignedRoom.ModelRoomId,
-                        RoomNo = assignedRoom.RoomNo,
-                        BuildingId = assignedRoom.BuildingId,
-                        SeatCount = cls.StudentCount,
-                        RoomSeat = assignedRoom.SeatCount
-                    }
-                };
+                        RoomId = seat.RoomId,
+                        RoomNo = seat.RoomNo,
+                        BuildingId = seat.BuildingId,
+                        SeatCount = seat.SeatCount,
+                        RoomSeat = seat.RoomSeat
+                    })
+                    .ToList();
             }
 
             results = BuildResults(subject, start, end, allocation);
@@ -441,27 +450,194 @@ namespace DTcms.Core.Common.Helpers
                     }
 
                     schedule.Add(new RoomInterval(start, end, session.Index, seat.Grade));
-                }
-            }
 
-            var usedRooms = allocation.SelectMany(x => x.Value.Select(v => v.RoomId)).Distinct();
-            foreach (var roomId in usedRooms)
-            {
-                if (!roomSessionUsage.TryGetValue(roomId, out var usage))
-                {
-                    usage = new Dictionary<int, int>();
-                    roomSessionUsage[roomId] = usage;
-                }
+                    if (!roomSessionUsage.TryGetValue(seat.RoomId, out var sessionUsage))
+                    {
+                        sessionUsage = new Dictionary<int, int>();
+                        roomSessionUsage[seat.RoomId] = sessionUsage;
+                    }
 
-                if (!usage.ContainsKey(session.Index))
-                {
-                    usage[session.Index] = 0;
-                }
+                    if (!sessionUsage.ContainsKey(session.Index))
+                    {
+                        sessionUsage[session.Index] = 0;
+                    }
 
-                usage[session.Index]++;
+                    sessionUsage[session.Index]++;
+                }
             }
 
             return true;
+        }
+
+        private static List<RoomSequenceCandidate> BuildClassRoomCandidates(AIExamModelClass cls, List<AIExamModelRoom> rooms)
+        {
+            const int MaxRoomsPerClass = 6;
+            var candidates = new List<RoomSequenceCandidate>();
+            var seen = new HashSet<string>();
+
+            foreach (var buildingGroup in rooms.GroupBy(r => r.BuildingId))
+            {
+                var ordered = buildingGroup
+                    .Where(r => r.SeatCount > 0)
+                    .OrderBy(r => r.RoomNo ?? int.MaxValue)
+                    .ThenBy(r => r.ModelRoomId)
+                    .ToList();
+
+                for (var i = 0; i < ordered.Count; i++)
+                {
+                    var sequence = new List<AIExamModelRoom>();
+                    var totalCapacity = 0;
+
+                    for (var j = i; j < ordered.Count && sequence.Count < MaxRoomsPerClass; j++)
+                    {
+                        var room = ordered[j];
+                        sequence.Add(room);
+                        totalCapacity += room.SeatCount;
+
+                        if (totalCapacity < cls.StudentCount)
+                        {
+                            continue;
+                        }
+
+                        if (sequence.Count > 1)
+                        {
+                            var previousCapacity = totalCapacity - room.SeatCount;
+                            if (previousCapacity >= cls.StudentCount)
+                            {
+                                continue;
+                            }
+                        }
+
+                        var distribution = DistributeStudentsEvenly(cls.StudentCount, sequence);
+                        if (distribution == null)
+                        {
+                            continue;
+                        }
+
+                        var key = string.Join("-", sequence.Select(r => r.ModelRoomId));
+                        if (!seen.Add(key))
+                        {
+                            continue;
+                        }
+
+                        var seats = sequence
+                            .Select(roomCandidate => new RoomSeatAllocation
+                            {
+                                ClassId = cls.ModelClassId,
+                                Grade = cls.Grade,
+                                RoomId = roomCandidate.ModelRoomId,
+                                RoomNo = roomCandidate.RoomNo,
+                                BuildingId = roomCandidate.BuildingId,
+                                SeatCount = distribution.TryGetValue(roomCandidate.ModelRoomId, out var value) ? value : 0,
+                                RoomSeat = roomCandidate.SeatCount
+                            })
+                            .Where(x => x.SeatCount > 0)
+                            .ToList();
+
+                        if (seats.Sum(x => x.SeatCount) != cls.StudentCount)
+                        {
+                            continue;
+                        }
+
+                        candidates.Add(new RoomSequenceCandidate(seats));
+                    }
+                }
+            }
+
+            return candidates
+                .OrderBy(c => c.Seats.Count)
+                .ThenBy(c => c.TotalCapacity - cls.StudentCount)
+                .ThenBy(c => c.Seats.Sum(s => s.RoomNo ?? int.MaxValue))
+                .ThenBy(c => c.Seats.Sum(s => s.RoomId))
+                .ToList();
+        }
+
+        private static Dictionary<int, int>? DistributeStudentsEvenly(int studentCount, List<AIExamModelRoom> sequence)
+        {
+            if (studentCount <= 0 || sequence.Count == 0)
+            {
+                return null;
+            }
+
+            var distribution = new Dictionary<int, int>();
+            var suffixCapacity = new int[sequence.Count];
+            var running = 0;
+            for (var index = sequence.Count - 1; index >= 0; index--)
+            {
+                running += sequence[index].SeatCount;
+                suffixCapacity[index] = running;
+            }
+
+            var remaining = studentCount;
+            for (var i = 0; i < sequence.Count; i++)
+            {
+                var room = sequence[i];
+                var roomsLeft = sequence.Count - i;
+                var restCapacity = suffixCapacity[i] - room.SeatCount;
+                var lowerBound = Math.Max(0, remaining - restCapacity);
+                var upperBound = Math.Min(room.SeatCount, remaining);
+
+                if (upperBound < lowerBound)
+                {
+                    return null;
+                }
+
+                var evenTarget = (int)Math.Ceiling((double)remaining / roomsLeft);
+                var assign = Math.Min(upperBound, Math.Max(lowerBound, evenTarget));
+                if (assign < lowerBound)
+                {
+                    assign = lowerBound;
+                }
+
+                distribution[room.ModelRoomId] = assign;
+                remaining -= assign;
+            }
+
+            if (remaining != 0)
+            {
+                return null;
+            }
+
+            if (distribution.Count > 1)
+            {
+                var roomLookup = sequence.ToDictionary(r => r.ModelRoomId, r => r);
+                while (true)
+                {
+                    var ordered = distribution.OrderBy(kv => kv.Value).ToList();
+                    if (ordered.Count <= 1)
+                    {
+                        break;
+                    }
+
+                    var minEntry = ordered.First();
+                    var maxEntry = ordered.Last();
+
+                    if (maxEntry.Value - minEntry.Value <= 1)
+                    {
+                        break;
+                    }
+
+                    if (!roomLookup.TryGetValue(minEntry.Key, out var minRoom) || !roomLookup.TryGetValue(maxEntry.Key, out var maxRoom))
+                    {
+                        break;
+                    }
+
+                    if (minEntry.Value + 1 > minRoom.SeatCount)
+                    {
+                        break;
+                    }
+
+                    if (maxEntry.Value <= 1)
+                    {
+                        break;
+                    }
+
+                    distribution[maxEntry.Key] -= 1;
+                    distribution[minEntry.Key] += 1;
+                }
+            }
+
+            return distribution;
         }
 
         private static List<AIExamResult> BuildResults(
@@ -865,6 +1041,18 @@ namespace DTcms.Core.Common.Helpers
             public DateTime Start { get; }
             public DateTime End { get; }
             public int SubjectId { get; }
+        }
+
+        private class RoomSequenceCandidate
+        {
+            public RoomSequenceCandidate(List<RoomSeatAllocation> seats)
+            {
+                Seats = seats;
+                TotalCapacity = seats.Sum(x => x.RoomSeat);
+            }
+
+            public List<RoomSeatAllocation> Seats { get; }
+            public int TotalCapacity { get; }
         }
 
         private class RoomSeatAllocation
