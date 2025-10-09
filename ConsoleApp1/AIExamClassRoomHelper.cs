@@ -131,6 +131,18 @@ namespace DTcms.Core.Common.Helpers
                     throw new InvalidOperationException($"No feasible room assignment found for class {examClass.ModelClassId}.");
                 }
 
+                int minimalRoomCount = segmentsForClass.Min(s => s.Rooms.Count);
+                segmentsForClass = segmentsForClass
+                    .Where(s => s.Rooms.Count == minimalRoomCount)
+                    .OrderBy(s => s.TotalCapacity)
+                    .ThenBy(s => string.Join("_", s.Rooms.OrderBy(id => id)))
+                    .ToList();
+
+                if (!segmentsForClass.Any())
+                {
+                    throw new InvalidOperationException($"No feasible room assignment found for class {examClass.ModelClassId}.");
+                }
+
                 classSegments.Add(segmentsForClass);
             }
 
@@ -201,6 +213,8 @@ namespace DTcms.Core.Common.Helpers
             }
 
             // Seat capacity constraints per room.
+            var roomAssignedExpressions = new Dictionary<int, LinearExpr>();
+
             foreach (var room in rooms)
             {
                 var capacityExpr = LinearExpr.Sum(orderedClasses.Select((cls, classIndex) =>
@@ -218,6 +232,8 @@ namespace DTcms.Core.Common.Helpers
 
                     return terms.Any() ? LinearExpr.Sum(terms) : LinearExpr.Constant(0);
                 }));
+
+                roomAssignedExpressions[room.ModelRoomId] = capacityExpr;
 
                 cpModel.Add(capacityExpr <= room.SeatCount);
             }
@@ -278,17 +294,33 @@ namespace DTcms.Core.Common.Helpers
 
             // Objective: minimize overall unused seats to prefer tighter fits and smaller rooms.
             var objectiveTerms = new List<LinearExpr>();
+
+            foreach (var room in rooms)
+            {
+                if (!roomAssignedExpressions.TryGetValue(room.ModelRoomId, out var assignedExpr))
+                {
+                    continue;
+                }
+
+                var assignedVar = cpModel.NewIntVar(0, room.SeatCount, $"room_{room.ModelRoomId}_assigned");
+                var slackVar = cpModel.NewIntVar(0, room.SeatCount, $"room_{room.ModelRoomId}_slack");
+
+                cpModel.Add(assignedVar == assignedExpr);
+                cpModel.Add(assignedVar + slackVar == room.SeatCount);
+
+                objectiveTerms.Add(slackVar * 1000);
+            }
+
             for (int classIndex = 0; classIndex < orderedClasses.Count; classIndex++)
             {
                 var examClass = orderedClasses[classIndex];
                 for (int segmentIndex = 0; segmentIndex < classSegments[classIndex].Count; segmentIndex++)
                 {
                     var segment = classSegments[classIndex][segmentIndex];
-                    int waste = Math.Max(0, segment.TotalCapacity - examClass.StudentCount);
-                    if (waste > 0)
-                    {
-                        objectiveTerms.Add(segmentVariables[classIndex][segmentIndex] * waste);
-                    }
+                    int segmentSizePenalty = segment.TotalCapacity;
+                    int roomUsagePenalty = segment.Rooms.Count * 10;
+
+                    objectiveTerms.Add(segmentVariables[classIndex][segmentIndex] * (segmentSizePenalty + roomUsagePenalty));
                 }
             }
 
