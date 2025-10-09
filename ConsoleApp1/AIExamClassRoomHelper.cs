@@ -243,11 +243,14 @@ namespace DTcms.Core.Common.Helpers
                         continue;
                     }
 
-                    var classUsageVars = relevantClasses
-                        .Select(idx => classRoomUsage.TryGetValue((idx, room.ModelRoomId), out var usage) ? usage : null)
-                        .Where(v => v != null)
-                        .Cast<BoolVar>()
-                        .ToList();
+                    var classUsageVars = new List<BoolVar>();
+                    foreach (var classIdx in relevantClasses)
+                    {
+                        if (classRoomUsage.TryGetValue((classIdx, room.ModelRoomId), out var usage))
+                        {
+                            classUsageVars.Add(usage);
+                        }
+                    }
 
                     if (!classUsageVars.Any())
                     {
