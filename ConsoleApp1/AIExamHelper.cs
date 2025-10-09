@@ -1892,9 +1892,18 @@ namespace DTcms.Core.Common.Helpers
 
             var minGap = Math.Max(0, config.MinExamInterval);
 
+            var usageLimit = GetRoomUsageLimit(slot.TimeNo);
+
             if (units.All(u => u.PrimaryCandidates.Count > 0))
             {
-                var primaryAssignment = TryAssignOffsetsForUnits(units, subjectRooms, durations, slot, minGap, useCombinedCandidates: false);
+                var primaryAssignment = TryAssignOffsetsForUnits(
+                    units,
+                    subjectRooms,
+                    durations,
+                    slot,
+                    minGap,
+                    usageLimit,
+                    useCombinedCandidates: false);
                 if (primaryAssignment != null)
                 {
                     return FinalizeSubjectOffsets(slotSubjects, primaryAssignment);
@@ -1906,7 +1915,14 @@ namespace DTcms.Core.Common.Helpers
                 return null;
             }
 
-            var fallbackAssignment = TryAssignOffsetsForUnits(units, subjectRooms, durations, slot, minGap, useCombinedCandidates: true);
+            var fallbackAssignment = TryAssignOffsetsForUnits(
+                units,
+                subjectRooms,
+                durations,
+                slot,
+                minGap,
+                usageLimit,
+                useCombinedCandidates: true);
             return fallbackAssignment == null ? null : FinalizeSubjectOffsets(slotSubjects, fallbackAssignment);
         }
 
@@ -2241,6 +2257,7 @@ namespace DTcms.Core.Common.Helpers
             Dictionary<int, int> durations,
             TimeSlotInfo slot,
             int minGap,
+            int usageLimit,
             bool useCombinedCandidates)
         {
             var orderedUnits = units
@@ -2274,7 +2291,17 @@ namespace DTcms.Core.Common.Helpers
 
                 foreach (var offset in candidates)
                 {
-                    if (!TryAssignUnit(unit, offset, assignments, roomSchedules, subjectRooms, durations, slot, minGap, out var added))
+                    if (!TryAssignUnit(
+                            unit,
+                            offset,
+                            assignments,
+                            roomSchedules,
+                            subjectRooms,
+                            durations,
+                            slot,
+                            minGap,
+                            usageLimit,
+                            out var added))
                     {
                         continue;
                     }
@@ -2302,6 +2329,7 @@ namespace DTcms.Core.Common.Helpers
             Dictionary<int, int> durations,
             TimeSlotInfo slot,
             int minGap,
+            int usageLimit,
             out List<(int roomId, RoomScheduleEntry entry)> addedEntries)
         {
             addedEntries = new List<(int, RoomScheduleEntry)>();
@@ -2325,6 +2353,11 @@ namespace DTcms.Core.Common.Helpers
                     if (!roomSchedules.TryGetValue(roomId, out var schedule))
                     {
                         continue;
+                    }
+
+                    if (usageLimit > 0 && schedule.Count >= usageLimit)
+                    {
+                        return false;
                     }
 
                     foreach (var entry in schedule)
@@ -2458,6 +2491,8 @@ namespace DTcms.Core.Common.Helpers
                 .GroupBy(s => s.SubjectId)
                 .Select(g => g.First())
                 .ToDictionary(s => s.SubjectId, s => s);
+
+            var roomUsageLimit = GetRoomUsageLimit(slot.TimeNo);
 
             var durations = new Dictionary<int, int>();
             foreach (var subject in subjectLookup.Values)
@@ -2717,6 +2752,11 @@ namespace DTcms.Core.Common.Helpers
                     var durationExpr = LinearExpr.Sum(subjectVars.Select(v => v.variable * durations[v.subjectId]).ToArray());
                     var countVar = cpModel.NewIntVar(0, subjectVars.Count, $"room_{roomCandidates[j].Room.RoomId}_subject_count");
                     cpModel.Add(countVar == LinearExpr.Sum(subjectBoolVars));
+
+                    if (roomUsageLimit > 0)
+                    {
+                        cpModel.Add(countVar <= roomUsageLimit);
+                    }
 
                     if (config.MinExamInterval > 0)
                     {
