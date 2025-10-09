@@ -131,17 +131,11 @@ namespace DTcms.Core.Common.Helpers
                     throw new InvalidOperationException($"No feasible room assignment found for class {examClass.ModelClassId}.");
                 }
 
-                int minimalRoomCount = segmentsForClass.Min(s => s.Rooms.Count);
                 segmentsForClass = segmentsForClass
-                    .Where(s => s.Rooms.Count == minimalRoomCount)
-                    .OrderBy(s => s.TotalCapacity)
+                    .OrderBy(s => s.Rooms.Count)
+                    .ThenBy(s => s.TotalCapacity)
                     .ThenBy(s => string.Join("_", s.Rooms.OrderBy(id => id)))
                     .ToList();
-
-                if (!segmentsForClass.Any())
-                {
-                    throw new InvalidOperationException($"No feasible room assignment found for class {examClass.ModelClassId}.");
-                }
 
                 classSegments.Add(segmentsForClass);
             }
