@@ -70,12 +70,19 @@ namespace DTcms.Core.Common.Helpers
                 return new List<AIExamResult>();
             }
 
+            var subjectTimeStates = InitializeSubjectTimeStates(subjects, timeSlots, model, config, error);
+            if (error.Length > 0)
+            {
+                throw new ResponseException(error.ToString(), ErrorCode.ParamError);
+            }
+
             var conflictCuts = new List<SlotTimeConflict>();
             var conflictCutKeys = new HashSet<string>();
             RoomAssignmentContainer? roomAssignments = null;
             Dictionary<int, int>? subjectTimeAssignments = null;
             SlotTimeConflict? lastConflict = null;
             var persistentClassPreferences = new Dictionary<int, ClassRoomPreference>();
+            var failureReasons = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
 
             var maxIterations = (int)Math.Max(1, Math.Min(50L, Math.Max(1L, (long)Math.Max(1, subjects.Count) * Math.Max(1, timeSlots.Count))));
             var attempt = 0;
@@ -87,7 +94,7 @@ namespace DTcms.Core.Common.Helpers
 
                 if (needTimeSolve || subjectTimeAssignments == null)
                 {
-                    subjectTimeAssignments = SolveSubjectTimeAllocation(config, subjects, timeSlots, model, conflictCuts, error);
+                    subjectTimeAssignments = SolveSubjectTimeAllocation(config, subjects, timeSlots, model, conflictCuts, subjectTimeStates, error);
                     if (subjectTimeAssignments == null)
                     {
                         throw new ResponseException(error.ToString(), ErrorCode.ParamError);
@@ -102,11 +109,29 @@ namespace DTcms.Core.Common.Helpers
                     break;
                 }
 
+                var appendedLength = error.Length - errorLengthBeforeRooms;
+                if (appendedLength > 0)
+                {
+                    var appended = error.ToString(errorLengthBeforeRooms, appendedLength);
+                    CollectFailureReasons(failureReasons, appended);
+                }
+
                 error.Length = errorLengthBeforeRooms;
 
                 if (conflict == null)
                 {
                     break;
+                }
+
+                if (TryExpandSubjectTimeWindow(conflict, subjectTimeStates, config))
+                {
+                    needTimeSolve = true;
+                    lastConflict = conflict;
+                    if (!TryAddConflictCut(conflictCuts, conflictCutKeys, conflict))
+                    {
+                        break;
+                    }
+                    continue;
                 }
 
                 if (RemoveClassPreferences(conflict, persistentClassPreferences))
@@ -139,6 +164,7 @@ namespace DTcms.Core.Common.Helpers
                     }
                 }
 
+                AppendFailureReasonSummary(failureReasons, config, error);
                 error.AppendLine("多次调整考试时间后仍无法满足考场约束，请检查排考数据是否存在冲突。");
                 throw new ResponseException(error.ToString(), ErrorCode.ParamError);
             }
@@ -190,6 +216,83 @@ namespace DTcms.Core.Common.Helpers
             }
 
             return removed;
+        }
+
+        private static bool TryExpandSubjectTimeWindow(SlotTimeConflict conflict,
+            Dictionary<int, SubjectTimeAdjustmentState> subjectTimeStates,
+            AIExamConfig config)
+        {
+            if (conflict.SubjectIds == null || conflict.SubjectIds.Count == 0)
+            {
+                return false;
+            }
+
+            var expanded = false;
+            foreach (var subjectId in conflict.SubjectIds)
+            {
+                if (!subjectTimeStates.TryGetValue(subjectId, out var state))
+                {
+                    continue;
+                }
+
+                if (TryExpandSubjectTolerance(state, config))
+                {
+                    expanded = true;
+                }
+            }
+
+            return expanded;
+        }
+
+        private static void CollectFailureReasons(Dictionary<string, int> failureReasons, string appended)
+        {
+            if (string.IsNullOrWhiteSpace(appended))
+            {
+                return;
+            }
+
+            var lines = appended
+                .Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
+                .Select(l => l.Trim())
+                .Where(l => !string.IsNullOrEmpty(l));
+
+            foreach (var line in lines)
+            {
+                if (failureReasons.TryGetValue(line, out var count))
+                {
+                    failureReasons[line] = count + 1;
+                }
+                else
+                {
+                    failureReasons[line] = 1;
+                }
+            }
+        }
+
+        private static void AppendFailureReasonSummary(Dictionary<string, int> failureReasons, AIExamConfig config, StringBuilder error)
+        {
+            if (failureReasons.Count == 0)
+            {
+                return;
+            }
+
+            var topN = Math.Max(1, config.FailureReasonTopN);
+            var summary = failureReasons
+                .OrderByDescending(kvp => kvp.Value)
+                .ThenBy(kvp => kvp.Key, StringComparer.Ordinal)
+                .Take(topN)
+                .ToList();
+
+            if (summary.Count == 0)
+            {
+                return;
+            }
+
+            error.AppendLine("排考失败原因统计：");
+            foreach (var item in summary)
+            {
+                error.AppendLine($"{item.Value} 次 - {item.Key}");
+            }
         }
 
         #region 构建基础数据
@@ -391,11 +494,138 @@ namespace DTcms.Core.Common.Helpers
 
         #region 科目与时间段求解
 
+        private static Dictionary<int, SubjectTimeAdjustmentState> InitializeSubjectTimeStates(
+            List<SubjectInfo> subjects,
+            List<TimeSlotInfo> timeSlots,
+            AIExamModel model,
+            AIExamConfig config,
+            StringBuilder error)
+        {
+            var result = new Dictionary<int, SubjectTimeAdjustmentState>();
+            var slotLookup = timeSlots.ToDictionary(t => t.Index);
+
+            foreach (var subject in subjects)
+            {
+                var state = new SubjectTimeAdjustmentState
+                {
+                    Subject = subject,
+                    RequiredDuration = subject.Duration > 0 ? subject.Duration : 60,
+                    MaxToleranceMinutes = Math.Max(0, config.TimeAdjustWindowMinutes)
+                };
+
+                var specifiedDate = subject.Subject.Date;
+                var specifiedStart = subject.Subject.StartTime;
+
+                var jointRule = model.RuleJointSubjectList?.FirstOrDefault(r => r.RuleJointSubjectList != null && r.RuleJointSubjectList.Any(i => i.ModelSubjectId == subject.SubjectId));
+                if (jointRule != null)
+                {
+                    if (!string.IsNullOrWhiteSpace(jointRule.Date))
+                    {
+                        specifiedDate = jointRule.Date;
+                    }
+                    if (!string.IsNullOrWhiteSpace(jointRule.StartTime))
+                    {
+                        specifiedStart = jointRule.StartTime;
+                    }
+                }
+
+                state.PreferredDate = specifiedDate;
+
+                if (!string.IsNullOrWhiteSpace(specifiedDate) && !string.IsNullOrWhiteSpace(specifiedStart) && TryParseDateTime(specifiedDate, specifiedStart, out var preferredStart))
+                {
+                    state.PreferredStart = preferredStart;
+                }
+
+                foreach (var slot in timeSlots)
+                {
+                    if (!string.IsNullOrWhiteSpace(specifiedDate) && !slot.Date.Equals(specifiedDate, StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    var duration = (int)Math.Round((slot.End - slot.Start).TotalMinutes);
+                    if (duration < state.RequiredDuration)
+                    {
+                        continue;
+                    }
+
+                    state.OrderedCandidates.Add(slot.Index);
+
+                    if (state.PreferredStart.HasValue)
+                    {
+                        state.CandidateDistance[slot.Index] = (int)Math.Abs((slot.Start - state.PreferredStart.Value).TotalMinutes);
+                    }
+                }
+
+                if (state.OrderedCandidates.Count == 0)
+                {
+                    if (!string.IsNullOrWhiteSpace(specifiedDate))
+                    {
+                        error.AppendLine($"科目 {subject.Subject.ModelSubjectName ?? subject.SubjectId.ToString()} 在指定日期 {specifiedDate} 内没有合适的考试场次。");
+                    }
+                    else
+                    {
+                        error.AppendLine($"科目 {subject.Subject.ModelSubjectName ?? subject.SubjectId.ToString()} 没有可用的考试时间段。");
+                    }
+                    continue;
+                }
+
+                state.OrderedCandidates.Sort((a, b) =>
+                {
+                    var diffA = state.CandidateDistance.TryGetValue(a, out var da) ? da : 0;
+                    var diffB = state.CandidateDistance.TryGetValue(b, out var db) ? db : 0;
+                    var compare = diffA.CompareTo(diffB);
+                    if (compare != 0)
+                    {
+                        return compare;
+                    }
+
+                    var slotA = slotLookup[a];
+                    var slotB = slotLookup[b];
+                    compare = slotA.Start.CompareTo(slotB.Start);
+                    if (compare != 0)
+                    {
+                        return compare;
+                    }
+
+                    return a.CompareTo(b);
+                });
+
+                if (state.PreferredStart == null)
+                {
+                    state.CurrentToleranceMinutes = state.MaxToleranceMinutes;
+                }
+
+                RefreshActiveCandidates(state);
+
+                if (state.ActiveCandidates.Count == 0)
+                {
+                    if (!EnsureMinimumCandidates(state, config))
+                    {
+                        if (!string.IsNullOrWhiteSpace(specifiedDate))
+                        {
+                            error.AppendLine($"科目 {subject.Subject.ModelSubjectName ?? subject.SubjectId.ToString()} 在允许的调整范围内没有可用的考试场次。");
+                        }
+                        else
+                        {
+                            error.AppendLine($"科目 {subject.Subject.ModelSubjectName ?? subject.SubjectId.ToString()} 没有可用的考试时间段。");
+                        }
+                        continue;
+                    }
+                }
+
+                result[subject.SubjectId] = state;
+            }
+
+            return result;
+        }
+
         private static Dictionary<int, int>? SolveSubjectTimeAllocation(AIExamConfig config,
             List<SubjectInfo> subjects,
             List<TimeSlotInfo> timeSlots,
             AIExamModel model,
             List<SlotTimeConflict> conflictCuts,
+            Dictionary<int, SubjectTimeAdjustmentState> subjectTimeStates,
             StringBuilder error)
         {
             var cpModel = new CpModel();
@@ -404,10 +634,22 @@ namespace DTcms.Core.Common.Helpers
 
             foreach (var subject in subjects)
             {
-                var candidates = GetCandidateTimeSlots(subject, timeSlots, model, error);
+                if (!subjectTimeStates.TryGetValue(subject.SubjectId, out var state))
+                {
+                    error.AppendLine($"科目 {subject.Subject.ModelSubjectName ?? subject.SubjectId.ToString()} 没有可用的考试时间段。");
+                    return null;
+                }
+
+                if (state.ActiveCandidates.Count == 0 && !EnsureMinimumCandidates(state, config))
+                {
+                    error.AppendLine($"科目 {subject.Subject.ModelSubjectName ?? subject.SubjectId.ToString()} 在允许的调整范围内没有可用的考试场次。");
+                    return null;
+                }
+
+                var candidates = state.ActiveCandidates.ToList();
                 if (candidates.Count == 0)
                 {
-                    error.AppendLine($"科目 {subject.Subject.ModelSubjectName ?? subject.SubjectId.ToString()} 没有可用的时间段。");
+                    error.AppendLine($"科目 {subject.Subject.ModelSubjectName ?? subject.SubjectId.ToString()} 没有可用的考试时间段。");
                     return null;
                 }
 
@@ -488,53 +730,108 @@ namespace DTcms.Core.Common.Helpers
             return result;
         }
 
-        private static List<int> GetCandidateTimeSlots(SubjectInfo subject, List<TimeSlotInfo> timeSlots, AIExamModel model, StringBuilder error)
+        private static bool EnsureMinimumCandidates(SubjectTimeAdjustmentState state, AIExamConfig config)
         {
-            var candidates = new List<int>();
-            var requiredDuration = subject.Duration > 0 ? subject.Duration : 60;
-            var specifiedDate = subject.Subject.Date;
-            var specifiedStart = subject.Subject.StartTime;
-
-            var jointRule = model.RuleJointSubjectList?.FirstOrDefault(r => r.RuleJointSubjectList != null && r.RuleJointSubjectList.Any(i => i.ModelSubjectId == subject.SubjectId));
-            if (jointRule != null)
+            if (state.ActiveCandidates.Count > 0)
             {
-                if (!string.IsNullOrWhiteSpace(jointRule.Date))
+                return true;
+            }
+
+            if (state.OrderedCandidates.Count == 0)
+            {
+                return false;
+            }
+
+            if (state.PreferredStart == null)
+            {
+                RefreshActiveCandidates(state);
+                return state.ActiveCandidates.Count > 0;
+            }
+
+            if (state.MaxToleranceMinutes <= 0 || config.TimeAdjustStepMinutes <= 0)
+            {
+                return false;
+            }
+
+            while (TryExpandSubjectTolerance(state, config))
+            {
+                if (state.ActiveCandidates.Count > 0)
                 {
-                    specifiedDate = jointRule.Date;
-                }
-                if (!string.IsNullOrWhiteSpace(jointRule.StartTime))
-                {
-                    specifiedStart = jointRule.StartTime;
+                    return true;
                 }
             }
 
-            foreach (var slot in timeSlots)
+            return state.ActiveCandidates.Count > 0;
+        }
+
+        private static bool TryExpandSubjectTolerance(SubjectTimeAdjustmentState state, AIExamConfig config)
+        {
+            if (state.PreferredStart == null)
             {
-                if (!string.IsNullOrWhiteSpace(specifiedDate) && !slot.Date.Equals(specifiedDate, StringComparison.OrdinalIgnoreCase))
-                {
-                    continue;
-                }
-
-                if (!string.IsNullOrWhiteSpace(specifiedStart) && !slot.Start.ToString("HH:mm").Equals(specifiedStart, StringComparison.OrdinalIgnoreCase))
-                {
-                    continue;
-                }
-
-                var duration = (int)Math.Round((slot.End - slot.Start).TotalMinutes);
-                if (duration < requiredDuration)
-                {
-                    continue;
-                }
-
-                candidates.Add(slot.Index);
+                return false;
             }
 
-            if (!string.IsNullOrWhiteSpace(specifiedDate) && candidates.Count == 0)
+            if (state.MaxToleranceMinutes <= 0)
             {
-                error.AppendLine($"科目 {subject.Subject.ModelSubjectName ?? subject.SubjectId.ToString()} 在指定日期 {specifiedDate} 内没有合适的考试场次。");
+                return false;
             }
 
-            return candidates;
+            if (config.TimeAdjustStepMinutes <= 0)
+            {
+                return false;
+            }
+
+            if (state.CurrentToleranceMinutes >= state.MaxToleranceMinutes)
+            {
+                return false;
+            }
+
+            var step = Math.Max(1, config.TimeAdjustStepMinutes);
+            var newTolerance = Math.Min(state.MaxToleranceMinutes, state.CurrentToleranceMinutes + step);
+            if (newTolerance == state.CurrentToleranceMinutes)
+            {
+                return false;
+            }
+
+            state.CurrentToleranceMinutes = newTolerance;
+            RefreshActiveCandidates(state);
+            return true;
+        }
+
+        private static void RefreshActiveCandidates(SubjectTimeAdjustmentState state)
+        {
+            state.ActiveCandidates.Clear();
+
+            if (state.OrderedCandidates.Count == 0)
+            {
+                return;
+            }
+
+            if (state.PreferredStart == null)
+            {
+                state.ActiveCandidates.AddRange(state.OrderedCandidates);
+                return;
+            }
+
+            if (state.MaxToleranceMinutes <= 0)
+            {
+                foreach (var index in state.OrderedCandidates)
+                {
+                    if (state.CandidateDistance.TryGetValue(index, out var diff) && diff == 0)
+                    {
+                        state.ActiveCandidates.Add(index);
+                    }
+                }
+                return;
+            }
+
+            foreach (var index in state.OrderedCandidates)
+            {
+                if (state.CandidateDistance.TryGetValue(index, out var diff) && diff <= state.CurrentToleranceMinutes)
+                {
+                    state.ActiveCandidates.Add(index);
+                }
+            }
         }
 
         private static void ApplyJointSubjectConstraints(List<SubjectInfo> subjects, AIExamModel model, CpModel cpModel, Dictionary<(int subjectId, int timeIndex), BoolVar> vars)
@@ -2797,6 +3094,19 @@ namespace DTcms.Core.Common.Helpers
             public List<ClassInfo> Classes { get; set; } = new();
         }
 
+        private sealed class SubjectTimeAdjustmentState
+        {
+            public SubjectInfo Subject { get; set; } = null!;
+            public string? PreferredDate { get; set; }
+            public DateTime? PreferredStart { get; set; }
+            public int RequiredDuration { get; set; }
+            public int MaxToleranceMinutes { get; set; }
+            public int CurrentToleranceMinutes { get; set; }
+            public List<int> OrderedCandidates { get; } = new List<int>();
+            public Dictionary<int, int> CandidateDistance { get; } = new Dictionary<int, int>();
+            public List<int> ActiveCandidates { get; } = new List<int>();
+        }
+
         private sealed class ClassRoomAssignment
         {
             public SubjectInfo Subject { get; set; } = null!;
@@ -2917,6 +3227,18 @@ namespace DTcms.Core.Common.Helpers
         /// 最小考试间隔,单位分钟
         /// </summary>
         public int MinExamInterval { get; set; } = 10;
+        /// <summary>
+        /// 当固定考试时间不可行时,允许向前/向后探索的最大时间窗(分钟)。小于等于 0 表示不启用自动时间调整。
+        /// </summary>
+        public int TimeAdjustWindowMinutes { get; set; } = 180;
+        /// <summary>
+        /// 自动时间调整的步长(分钟)。每次扩展容差时按该步长递增。
+        /// </summary>
+        public int TimeAdjustStepMinutes { get; set; } = 30;
+        /// <summary>
+        /// 排考失败时输出的错误原因条目数量。
+        /// </summary>
+        public int FailureReasonTopN { get; set; } = 5;
     }
 
     public class AIExamModel
