@@ -1,4 +1,4 @@
-﻿using DTcms.Core.Common.Emums;
+using DTcms.Core.Common.Emums;
 using DTcms.Core.Common.Extensions;
 using Google.OrTools.Sat;
 using System;
@@ -18,7 +18,7 @@ namespace DTcms.Core.Common.Helpers
         /// <summary>
         /// 自动安排班级考场
         /// </summary>
-        public static List<AIExamClassRoomResult> AutoClassRoom(AIExamClassRoomModel model)
+        public static List<AIExamClassRoomResult> AutoAssignRooms(AIExamClassRoomModel model)
         {
             List<AIExamClassRoomResult> result = new List<AIExamClassRoomResult>();
             return result;
