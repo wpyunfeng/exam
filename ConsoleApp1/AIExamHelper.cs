@@ -1281,7 +1281,20 @@ namespace DTcms.Core.Common.Helpers
                     var fallbackOffsets = ComputeSubjectStartOffsets(slotSubjects, slot, allocationResult, config, model);
                     if (fallbackOffsets == null)
                     {
-                        error.AppendLine($"无法在场次 {slot.Date} {slot.Start:HH:mm} 为科目的考试安排合适的开始时间。");
+                        error.AppendLine($"无法在场次 {slot.Date} {slot.Start:HH:mm} 为科目的考试安排非重叠的开始时间，请尝试调整到其他场次。");
+
+                        var impactedSubjects = slotSubjects
+                            .Select(s => s.SubjectId)
+                            .Distinct()
+                            .ToList();
+
+                        conflict = new SlotTimeConflict
+                        {
+                            TimeIndex = timeIndex,
+                            SubjectIds = impactedSubjects,
+                            ClassIds = CollectClassIdsForSubjects(allocationResult, impactedSubjects.ToArray())
+                        };
+
                         return null;
                     }
 
