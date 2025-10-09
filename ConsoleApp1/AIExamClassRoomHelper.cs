@@ -86,38 +86,10 @@ namespace DTcms.Core.Common.Helpers
                                 continue;
                             }
 
-                            var distribution = DistributeStudentsEvenly(examClass.StudentCount, roomsInSegment);
-                            if (distribution == null)
-                            {
-                                continue;
-                            }
-
-                            bool fitsAllRooms = true;
-                            for (int idx = 0; idx < roomsInSegment.Count; idx++)
-                            {
-                                if (distribution[idx] > roomsInSegment[idx].SeatCount)
-                                {
-                                    fitsAllRooms = false;
-                                    break;
-                                }
-                            }
-
-                            if (!fitsAllRooms)
-                            {
-                                continue;
-                            }
-
-                            var assignments = new Dictionary<int, int>();
-                            for (int idx = 0; idx < roomsInSegment.Count; idx++)
-                            {
-                                assignments[roomsInSegment[idx].ModelRoomId] = distribution[idx];
-                            }
-
                             var segmentOption = new SegmentOption
                             {
                                 BuildingId = building.Key,
                                 Rooms = roomsInSegment.Select(r => r.ModelRoomId).ToList(),
-                                RoomAssignments = assignments,
                                 TotalCapacity = capacitySum
                             };
 
@@ -144,6 +116,7 @@ namespace DTcms.Core.Common.Helpers
 
             // Decision variables: whether a class chooses a specific segment.
             var segmentVariables = new BoolVar[orderedClasses.Count][];
+            var segmentRoomAssignments = new Dictionary<(int classIndex, int segmentIndex, int roomId), IntVar>();
 
             for (int classIndex = 0; classIndex < orderedClasses.Count; classIndex++)
             {
@@ -174,14 +147,43 @@ namespace DTcms.Core.Common.Helpers
                     var segment = segmentsForClass[segmentIndex];
                     var segmentVar = segmentVariables[classIndex][segmentIndex];
 
-                    foreach (var roomAssignment in segment.RoomAssignments)
-                    {
-                        int roomId = roomAssignment.Key;
-                        if (roomAssignment.Value <= 0)
-                        {
-                            continue;
-                        }
+                    var assignVars = new List<IntVar>();
 
+                    foreach (var roomId in segment.Rooms)
+                    {
+                        var room = roomById[roomId];
+                        var assignVar = cpModel.NewIntVar(0, room.SeatCount, $"class_{classIndex}_segment_{segmentIndex}_room_{roomId}_students");
+                        segmentRoomAssignments[(classIndex, segmentIndex, roomId)] = assignVar;
+
+                        cpModel.Add(assignVar == 0).OnlyEnforceIf(segmentVar.Not());
+                        cpModel.Add(assignVar >= 1).OnlyEnforceIf(segmentVar);
+
+                        assignVars.Add(assignVar);
+                    }
+
+                    cpModel.Add(LinearExpr.Sum(assignVars) == orderedClasses[classIndex].StudentCount).OnlyEnforceIf(segmentVar);
+
+                    if (assignVars.Count > 0)
+                    {
+                        cpModel.Add(LinearExpr.Sum(assignVars) == 0).OnlyEnforceIf(segmentVar.Not());
+                    }
+
+                    for (int i = 0; i < segment.Rooms.Count; i++)
+                    {
+                        for (int j = i + 1; j < segment.Rooms.Count; j++)
+                        {
+                            var roomI = segment.Rooms[i];
+                            var roomJ = segment.Rooms[j];
+                            var assignI = segmentRoomAssignments[(classIndex, segmentIndex, roomI)];
+                            var assignJ = segmentRoomAssignments[(classIndex, segmentIndex, roomJ)];
+
+                            cpModel.Add(assignI - assignJ <= 1).OnlyEnforceIf(segmentVar);
+                            cpModel.Add(assignJ - assignI <= 1).OnlyEnforceIf(segmentVar);
+                        }
+                    }
+
+                    foreach (var roomId in segment.Rooms)
+                    {
                         if (!roomToSegments.TryGetValue(roomId, out var list))
                         {
                             list = new List<BoolVar>();
@@ -202,34 +204,78 @@ namespace DTcms.Core.Common.Helpers
                         cpModel.AddImplication(segVar, usageVar);
                     }
 
-                    cpModel.Add(usageVar <= LinearExpr.Sum(kvp.Value));
+                    if (kvp.Value.Count > 0)
+                    {
+                        cpModel.Add(usageVar <= LinearExpr.Sum(kvp.Value));
+                    }
+                }
+            }
+
+            // Aggregate per-class room assignments and enforce usage links.
+            var classRoomAssignments = new Dictionary<(int classIndex, int roomId), IntVar>();
+
+            for (int classIndex = 0; classIndex < orderedClasses.Count; classIndex++)
+            {
+                foreach (var room in rooms)
+                {
+                    var relatedAssignments = new List<IntVar>();
+
+                    for (int segmentIndex = 0; segmentIndex < classSegments[classIndex].Count; segmentIndex++)
+                    {
+                        if (!classSegments[classIndex][segmentIndex].Rooms.Contains(room.ModelRoomId))
+                        {
+                            continue;
+                        }
+
+                        if (segmentRoomAssignments.TryGetValue((classIndex, segmentIndex, room.ModelRoomId), out var assignVar))
+                        {
+                            relatedAssignments.Add(assignVar);
+                        }
+                    }
+
+                    if (!relatedAssignments.Any())
+                    {
+                        continue;
+                    }
+
+                    var totalVar = cpModel.NewIntVar(0, room.SeatCount, $"class_{classIndex}_room_{room.ModelRoomId}_total");
+                    cpModel.Add(totalVar == LinearExpr.Sum(relatedAssignments));
+                    classRoomAssignments[(classIndex, room.ModelRoomId)] = totalVar;
+
+                    var usageVar = classRoomUsage[(classIndex, room.ModelRoomId)];
+                    cpModel.Add(totalVar >= 1).OnlyEnforceIf(usageVar);
+                    cpModel.Add(totalVar == 0).OnlyEnforceIf(usageVar.Not());
                 }
             }
 
             // Seat capacity constraints per room.
-            var roomAssignedExpressions = new Dictionary<int, LinearExpr>();
+            var roomAssignedExpressions = new Dictionary<int, IntVar>();
 
             foreach (var room in rooms)
             {
-                var capacityExpr = LinearExpr.Sum(orderedClasses.Select((cls, classIndex) =>
+                var perClassAssignments = new List<IntVar>();
+
+                for (int classIndex = 0; classIndex < orderedClasses.Count; classIndex++)
                 {
-                    var segmentsForClass = classSegments[classIndex];
-                    var terms = new List<LinearExpr>();
-                    for (int segmentIndex = 0; segmentIndex < segmentsForClass.Count; segmentIndex++)
+                    if (classRoomAssignments.TryGetValue((classIndex, room.ModelRoomId), out var assignment))
                     {
-                        var segment = segmentsForClass[segmentIndex];
-                        if (segment.RoomAssignments.TryGetValue(room.ModelRoomId, out int assigned))
-                        {
-                            terms.Add(segmentVariables[classIndex][segmentIndex] * assigned);
-                        }
+                        perClassAssignments.Add(assignment);
                     }
+                }
 
-                    return terms.Any() ? LinearExpr.Sum(terms) : LinearExpr.Constant(0);
-                }));
+                var totalAssigned = cpModel.NewIntVar(0, room.SeatCount, $"room_{room.ModelRoomId}_assigned_total");
+                roomAssignedExpressions[room.ModelRoomId] = totalAssigned;
 
-                roomAssignedExpressions[room.ModelRoomId] = capacityExpr;
+                if (perClassAssignments.Any())
+                {
+                    cpModel.Add(totalAssigned == LinearExpr.Sum(perClassAssignments));
+                }
+                else
+                {
+                    cpModel.Add(totalAssigned == 0);
+                }
 
-                cpModel.Add(capacityExpr <= room.SeatCount);
+                cpModel.Add(totalAssigned <= room.SeatCount);
             }
 
             // Grade constraints: at most one class per grade per room and at most two grades per room.
@@ -291,15 +337,13 @@ namespace DTcms.Core.Common.Helpers
 
             foreach (var room in rooms)
             {
-                if (!roomAssignedExpressions.TryGetValue(room.ModelRoomId, out var assignedExpr))
+                if (!roomAssignedExpressions.TryGetValue(room.ModelRoomId, out var assignedVar))
                 {
                     continue;
                 }
 
-                var assignedVar = cpModel.NewIntVar(0, room.SeatCount, $"room_{room.ModelRoomId}_assigned");
                 var slackVar = cpModel.NewIntVar(0, room.SeatCount, $"room_{room.ModelRoomId}_slack");
 
-                cpModel.Add(assignedVar == assignedExpr);
                 cpModel.Add(assignedVar + slackVar == room.SeatCount);
 
                 objectiveTerms.Add(slackVar * 1000);
@@ -363,7 +407,8 @@ namespace DTcms.Core.Common.Helpers
 
                 foreach (var room in orderedRooms)
                 {
-                    int assigned = chosenSegment.RoomAssignments[room.ModelRoomId];
+                    var assignVar = segmentRoomAssignments[(classIndex, chosenSegmentIndex, room.ModelRoomId)];
+                    int assigned = (int)solver.Value(assignVar);
                     if (assigned <= 0)
                     {
                         continue;
@@ -381,42 +426,11 @@ namespace DTcms.Core.Common.Helpers
             return results;
         }
 
-        private static int[]? DistributeStudentsEvenly(int studentCount, List<AIExamClassRoomModelRoom> rooms)
-        {
-            if (rooms == null || rooms.Count == 0)
-            {
-                return null;
-            }
-
-            int roomCount = rooms.Count;
-            if (roomCount == 0)
-            {
-                return null;
-            }
-
-            int baseCount = studentCount / roomCount;
-            int remainder = studentCount % roomCount;
-
-            var distribution = new int[roomCount];
-            for (int i = 0; i < roomCount; i++)
-            {
-                distribution[i] = baseCount + (i < remainder ? 1 : 0);
-                if (distribution[i] <= 0)
-                {
-                    return null;
-                }
-            }
-
-            return distribution;
-        }
-
         private class SegmentOption
         {
             public int BuildingId { get; set; }
 
             public List<int> Rooms { get; set; } = new List<int>();
-
-            public Dictionary<int, int> RoomAssignments { get; set; } = new Dictionary<int, int>();
 
             public int TotalCapacity { get; set; }
         }
