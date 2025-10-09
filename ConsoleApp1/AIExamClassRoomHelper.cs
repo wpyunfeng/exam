@@ -60,7 +60,7 @@ namespace DTcms.Core.Common.Helpers
                 var examClass = orderedClasses[classIndex];
                 var segmentsForClass = new List<SegmentOption>();
 
-                foreach (var building in roomsByBuilding)
+                foreach (var building in roomsByBuilding.OrderBy(b => b.Key))
                 {
                     var buildingRooms = building.Value;
                     for (int start = 0; start < buildingRooms.Count; start++)
@@ -104,8 +104,7 @@ namespace DTcms.Core.Common.Helpers
                 }
 
                 segmentsForClass = segmentsForClass
-                    .OrderBy(s => s.Rooms.Count)
-                    .ThenBy(s => s.TotalCapacity)
+                    .OrderBy(s => s.BuildingId)
                     .ThenBy(s => string.Join("_", s.Rooms.OrderBy(id => id)))
                     .ToList();
 
@@ -332,7 +331,7 @@ namespace DTcms.Core.Common.Helpers
                 }
             }
 
-            // Objective: minimize overall unused seats to prefer tighter fits and smaller rooms.
+            // Objective: minimize overall unused seats while maintaining balanced utilization.
             var objectiveTerms = new List<LinearExpr>();
 
             foreach (var room in rooms)
@@ -347,19 +346,6 @@ namespace DTcms.Core.Common.Helpers
                 cpModel.Add(assignedVar + slackVar == room.SeatCount);
 
                 objectiveTerms.Add(slackVar * 1000);
-            }
-
-            for (int classIndex = 0; classIndex < orderedClasses.Count; classIndex++)
-            {
-                var examClass = orderedClasses[classIndex];
-                for (int segmentIndex = 0; segmentIndex < classSegments[classIndex].Count; segmentIndex++)
-                {
-                    var segment = classSegments[classIndex][segmentIndex];
-                    int segmentSizePenalty = segment.TotalCapacity;
-                    int roomUsagePenalty = segment.Rooms.Count * 10;
-
-                    objectiveTerms.Add(segmentVariables[classIndex][segmentIndex] * (segmentSizePenalty + roomUsagePenalty));
-                }
             }
 
             if (objectiveTerms.Any())
