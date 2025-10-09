@@ -1,4 +1,4 @@
-﻿using DTcms.Core.Common.Helpers;
+using DTcms.Core.Common.Helpers;
 using System;
 using System.Collections.Generic;
  
@@ -12,7 +12,7 @@ try
     var classRoom = JsonHelper.ToJson<AIExamClassRoomModel>(classRoomStr);
 
     // 调用自动排考方法
-    var classRoomList = AIExamClassRoomHelper.AutoClassRoom(classRoom);
+    var classRoomList = AIExamClassRoomHelper.AutoAssignRooms(classRoom);
 
     Console.WriteLine($"\n自动班级分配考场成功！共生成 {classRoomList.Count} 条结果：\n");
 
