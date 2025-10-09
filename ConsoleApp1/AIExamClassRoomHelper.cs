@@ -41,6 +41,14 @@ namespace DTcms.Core.Common.Helpers
             // Maintain deterministic ordering based on provided list order for classes.
             var orderedClasses = classes.ToList();
 
+            // Quick feasibility check: total available seats must at least cover all students.
+            var totalStudentCount = orderedClasses.Sum(c => c.StudentCount);
+            var totalSeatCount = rooms.Sum(r => r.SeatCount);
+            if (totalSeatCount < totalStudentCount)
+            {
+                throw new InvalidOperationException($"Total student count {totalStudentCount} exceeds overall seat capacity {totalSeatCount}. Provide additional rooms or reduce participants.");
+            }
+
             // Group rooms by building and order by room number (fallback to room id if missing).
             var roomsByBuilding = rooms
                 .GroupBy(r => r.BuildingId)
@@ -286,7 +294,8 @@ namespace DTcms.Core.Common.Helpers
 
             if (status != CpSolverStatus.Optimal && status != CpSolverStatus.Feasible)
             {
-                throw new InvalidOperationException("Unable to find a feasible room assignment satisfying all constraints.");
+                throw new InvalidOperationException(
+                    $"Unable to find a feasible room assignment satisfying all constraints. Total students: {totalStudentCount}, total seats: {totalSeatCount}. Consider adding more capacity or relaxing constraints.");
             }
 
             var results = new List<AIExamClassRoomResult>();
