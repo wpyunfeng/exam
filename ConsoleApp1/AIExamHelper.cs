@@ -1671,10 +1671,20 @@ namespace DTcms.Core.Common.Helpers
             AIExamConfig config,
             AIExamModel model)
         {
-            var offsets = new Dictionary<int, int>();
+            return TryGenerateSubjectOffsetsWithStepSearch(slotSubjects, slot, allocationResult, config, model);
+        }
+
+        private static Dictionary<int, int>? TryGenerateSubjectOffsetsWithStepSearch(
+            List<SubjectInfo> slotSubjects,
+            TimeSlotInfo slot,
+            SlotRoomAllocationResult allocationResult,
+            AIExamConfig config,
+            AIExamModel model)
+        {
+            var result = new Dictionary<int, int>();
             if (slotSubjects.Count == 0)
             {
-                return offsets;
+                return result;
             }
 
             var slotDuration = GetSlotDurationMinutes(slot);
@@ -1683,9 +1693,7 @@ namespace DTcms.Core.Common.Helpers
                 return null;
             }
 
-            var subjectIds = new HashSet<int>(slotSubjects.Select(s => s.SubjectId));
             var durations = new Dictionary<int, int>();
-
             foreach (var subject in slotSubjects)
             {
                 if (!TryGetSubjectDuration(subject, slotDuration, out var duration))
@@ -1696,326 +1704,536 @@ namespace DTcms.Core.Common.Helpers
                 durations[subject.SubjectId] = duration;
             }
 
-            var roomSubjectMap = new Dictionary<int, HashSet<int>>();
-            foreach (var kvp in allocationResult.ClassAllocations)
-            {
-                var subjectId = kvp.Key.subjectId;
-                if (!subjectIds.Contains(subjectId))
-                {
-                    continue;
-                }
-
-                foreach (var allocation in kvp.Value)
-                {
-                    if (!roomSubjectMap.TryGetValue(allocation.Room.RoomId, out var set))
-                    {
-                        set = new HashSet<int>();
-                        roomSubjectMap[allocation.Room.RoomId] = set;
-                    }
-
-                    set.Add(subjectId);
-                }
-            }
-
-            var fixedOffsets = new Dictionary<int, int>();
-            foreach (var subject in slotSubjects)
-            {
-                if (TryGetStartOffset(subject.Subject.StartTime, slot, out var fixedOffset))
-                {
-                    fixedOffsets[subject.SubjectId] = fixedOffset;
-                }
-            }
-
-            if (model.RuleJointSubjectList != null)
-            {
-                foreach (var rule in model.RuleJointSubjectList)
-                {
-                    if (rule.RuleJointSubjectList == null)
-                    {
-                        continue;
-                    }
-
-                    if (!string.IsNullOrWhiteSpace(rule.Date) && !rule.Date.Equals(slot.Date, StringComparison.OrdinalIgnoreCase))
-                    {
-                        continue;
-                    }
-
-                    var group = rule.RuleJointSubjectList
-                        .Select(item => item.ModelSubjectId)
-                        .Where(subjectIds.Contains)
-                        .Distinct()
-                        .ToList();
-
-                    if (group.Count == 0)
-                    {
-                        continue;
-                    }
-
-                    if (!string.IsNullOrWhiteSpace(rule.StartTime))
-                    {
-                        if (!TryGetStartOffset(rule.StartTime, slot, out var groupOffset))
-                        {
-                            return null;
-                        }
-
-                        foreach (var subjectId in group)
-                        {
-                            if (fixedOffsets.TryGetValue(subjectId, out var existing) && existing != groupOffset)
-                            {
-                                return null;
-                            }
-
-                            fixedOffsets[subjectId] = groupOffset;
-                        }
-                    }
-                }
-            }
-
-            var cpModel = new CpModel();
-            var startVars = new Dictionary<int, IntVar>();
-
-            foreach (var subject in slotSubjects)
-            {
-                var subjectId = subject.SubjectId;
-                var duration = durations[subjectId];
-                var maxOffset = slotDuration - duration;
-                if (maxOffset < 0)
-                {
-                    return null;
-                }
-
-                var startVar = cpModel.NewIntVar(0, maxOffset, $"slot_{slot.Index}_subject_{subjectId}_start");
-                cpModel.Add(startVar + duration <= slotDuration);
-
-                if (fixedOffsets.TryGetValue(subjectId, out var fixedValue))
-                {
-                    if (fixedValue < 0 || fixedValue > maxOffset)
-                    {
-                        return null;
-                    }
-
-                    cpModel.Add(startVar == fixedValue);
-                }
-
-                startVars[subjectId] = startVar;
-            }
-
-            var gap = Math.Max(0, config.MinExamInterval);
-            var processedPairs = new HashSet<(int first, int second)>();
-
-            foreach (var kvp in roomSubjectMap)
-            {
-                var list = kvp.Value.Where(startVars.ContainsKey).ToList();
-                for (var i = 0; i < list.Count; i++)
-                {
-                    for (var j = i + 1; j < list.Count; j++)
-                    {
-                        var a = list[i];
-                        var b = list[j];
-                        var orderedPair = a < b
-                            ? (first: a, second: b)
-                            : (first: b, second: a);
-                        if (!processedPairs.Add(orderedPair))
-                        {
-                            continue;
-                        }
-
-                        var orderVar = cpModel.NewBoolVar($"slot_{slot.Index}_room_{kvp.Key}_order_{orderedPair.first}_{orderedPair.second}");
-                        cpModel.Add(startVars[a] + durations[a] + gap <= startVars[b]).OnlyEnforceIf(orderVar);
-                        cpModel.Add(startVars[b] + durations[b] + gap <= startVars[a]).OnlyEnforceIf(orderVar.Not());
-                    }
-                }
-            }
-
-            if (model.RuleJointSubjectList != null)
-            {
-                foreach (var rule in model.RuleJointSubjectList)
-                {
-                    if (rule.RuleJointSubjectList == null)
-                    {
-                        continue;
-                    }
-
-                    if (!string.IsNullOrWhiteSpace(rule.Date) && !rule.Date.Equals(slot.Date, StringComparison.OrdinalIgnoreCase))
-                    {
-                        continue;
-                    }
-
-                    var group = rule.RuleJointSubjectList
-                        .Select(item => item.ModelSubjectId)
-                        .Where(id => subjectIds.Contains(id) && startVars.ContainsKey(id))
-                        .Distinct()
-                        .ToList();
-
-                    if (group.Count <= 1)
-                    {
-                        continue;
-                    }
-
-                    var anchor = group[0];
-                    foreach (var subjectId in group.Skip(1))
-                    {
-                        cpModel.Add(startVars[subjectId] == startVars[anchor]);
-                    }
-                }
-            }
-
-            if (startVars.Count == 0)
-            {
-                return offsets;
-            }
-
-            var endExprs = startVars.Select(kvp => kvp.Value + durations[kvp.Key]).ToArray();
-            var maxEndVar = cpModel.NewIntVar(0, slotDuration, $"slot_{slot.Index}_max_end");
-            cpModel.AddMaxEquality(maxEndVar, endExprs);
-
-            var objectiveTerms = new List<LinearExpr>
-            {
-                maxEndVar * 1000L,
-                LinearExpr.Sum(startVars.Values.ToArray())
-            };
-
-            cpModel.Minimize(LinearExpr.Sum(objectiveTerms.ToArray()));
-
-            var solver = new CpSolver
-            {
-                StringParameters = "max_time_in_seconds:10"
-            };
-
-            var status = solver.Solve(cpModel);
-            if (status != CpSolverStatus.Feasible && status != CpSolverStatus.Optimal)
+            var subjectRooms = BuildSubjectRoomUsage(allocationResult, slotSubjects.Select(s => s.SubjectId));
+            var candidateMap = BuildSubjectOffsetCandidates(slotSubjects, slot, durations, config, model, slotDuration);
+            if (candidateMap == null)
             {
                 return null;
             }
 
-            foreach (var subject in slotSubjects)
+            var units = BuildOffsetSearchUnits(slotSubjects, slot, candidateMap, model);
+            if (units.Count == 0)
             {
-                if (startVars.TryGetValue(subject.SubjectId, out var startVar))
+                return FinalizeSubjectOffsets(slotSubjects, result);
+            }
+
+            var minGap = Math.Max(0, config.MinExamInterval);
+
+            if (units.All(u => u.PrimaryCandidates.Count > 0))
+            {
+                var primaryAssignment = TryAssignOffsetsForUnits(units, subjectRooms, durations, slot, minGap, useCombinedCandidates: false);
+                if (primaryAssignment != null)
                 {
-                    offsets[subject.SubjectId] = (int)solver.Value(startVar);
-                }
-                else
-                {
-                    offsets[subject.SubjectId] = 0;
+                    return FinalizeSubjectOffsets(slotSubjects, primaryAssignment);
                 }
             }
 
-            return offsets;
+            if (units.Any(u => u.CombinedCandidates.Count == 0))
+            {
+                return null;
+            }
+
+            var fallbackAssignment = TryAssignOffsetsForUnits(units, subjectRooms, durations, slot, minGap, useCombinedCandidates: true);
+            return fallbackAssignment == null ? null : FinalizeSubjectOffsets(slotSubjects, fallbackAssignment);
         }
 
-        private static bool ValidateRoomSchedules(
-            List<SubjectInfo> slotSubjects,
-            SlotRoomAllocationResult allocationResult,
-            TimeSlotInfo slot,
-            Dictionary<int, int> subjectOffsets,
-            AIExamConfig config,
-            out SlotTimeConflict? conflict)
+        private static Dictionary<int, int> FinalizeSubjectOffsets(List<SubjectInfo> slotSubjects, Dictionary<int, int> offsets)
         {
-            conflict = null;
-
-            if (slotSubjects.Count == 0 || allocationResult.ClassAllocations.Count == 0)
+            var finalized = new Dictionary<int, int>();
+            foreach (var subject in slotSubjects)
             {
-                return true;
+                if (!offsets.TryGetValue(subject.SubjectId, out var offset))
+                {
+                    offset = 0;
+                }
+
+                finalized[subject.SubjectId] = offset;
             }
 
-            var subjectLookup = slotSubjects.ToDictionary(s => s.SubjectId, s => s);
-            var roomSchedules = new Dictionary<int, List<(SubjectInfo Subject, int StartOffset, int Duration)>>();
+            return finalized;
+        }
+
+        private static Dictionary<int, HashSet<int>> BuildSubjectRoomUsage(
+            SlotRoomAllocationResult allocationResult,
+            IEnumerable<int> subjectIds)
+        {
+            var subjectSet = new HashSet<int>(subjectIds);
+            var usage = new Dictionary<int, HashSet<int>>();
 
             foreach (var kvp in allocationResult.ClassAllocations)
             {
-                if (!subjectLookup.TryGetValue(kvp.Key.subjectId, out var subject))
+                if (!subjectSet.Contains(kvp.Key.subjectId))
                 {
                     continue;
+                }
+
+                if (!usage.TryGetValue(kvp.Key.subjectId, out var rooms))
+                {
+                    rooms = new HashSet<int>();
+                    usage[kvp.Key.subjectId] = rooms;
                 }
 
                 foreach (var allocation in kvp.Value)
                 {
-                    if (!roomSchedules.TryGetValue(allocation.Room.RoomId, out var list))
+                    rooms.Add(allocation.Room.RoomId);
+                }
+            }
+
+            return usage;
+        }
+
+        private static Dictionary<int, SubjectOffsetCandidates>? BuildSubjectOffsetCandidates(
+            List<SubjectInfo> slotSubjects,
+            TimeSlotInfo slot,
+            Dictionary<int, int> durations,
+            AIExamConfig config,
+            AIExamModel model,
+            int slotDuration)
+        {
+            var result = new Dictionary<int, SubjectOffsetCandidates>();
+            var step = config.TimeAdjustStepMinutes > 0 ? config.TimeAdjustStepMinutes : 5;
+            step = Math.Max(1, step);
+
+            foreach (var subject in slotSubjects)
+            {
+                var subjectId = subject.SubjectId;
+                if (!durations.TryGetValue(subjectId, out var duration))
+                {
+                    return null;
+                }
+
+                var limit = slotDuration - duration;
+                if (limit < 0)
+                {
+                    return null;
+                }
+
+                var candidates = new SubjectOffsetCandidates();
+                var preferredOffset = GetPreferredStartOffset(subject, slot, model, limit);
+
+                if (preferredOffset.HasValue)
+                {
+                    candidates.AddForward(preferredOffset.Value);
+                }
+
+                for (var offset = 0; offset <= limit; offset += step)
+                {
+                    candidates.AddForward(offset);
+                    if (offset == limit)
                     {
-                        list = new List<(SubjectInfo Subject, int StartOffset, int Duration)>();
-                        roomSchedules[allocation.Room.RoomId] = list;
+                        break;
                     }
 
-                    if (list.Any(entry => entry.Subject.SubjectId == subject.SubjectId))
+                    if (offset + step > limit && offset != limit)
+                    {
+                        candidates.AddForward(limit);
+                        break;
+                    }
+                }
+
+                if (!candidates.ForwardAny())
+                {
+                    candidates.AddForward(0);
+                }
+
+                for (var offset = limit; offset >= 0; offset -= step)
+                {
+                    candidates.AddBackward(offset);
+                    if (offset == 0)
+                    {
+                        break;
+                    }
+
+                    if (offset - step < 0 && offset != 0)
+                    {
+                        candidates.AddBackward(0);
+                        break;
+                    }
+                }
+
+                result[subjectId] = candidates;
+            }
+
+            return result;
+        }
+
+        private static int? GetPreferredStartOffset(
+            SubjectInfo subject,
+            TimeSlotInfo slot,
+            AIExamModel model,
+            int limit)
+        {
+            int? preferred = null;
+
+            if (!string.IsNullOrWhiteSpace(subject.Subject.StartTime) && TryGetStartOffset(subject.Subject.StartTime, slot, out var subjectOffset))
+            {
+                if (subjectOffset >= 0 && subjectOffset <= limit)
+                {
+                    preferred = subjectOffset;
+                }
+            }
+
+            if (model.RuleJointSubjectList != null)
+            {
+                foreach (var rule in model.RuleJointSubjectList)
+                {
+                    if (rule.RuleJointSubjectList == null || string.IsNullOrWhiteSpace(rule.StartTime))
                     {
                         continue;
                     }
 
-                    var duration = GetSubjectDurationForSlot(subject, slot);
-                    if (duration <= 0)
+                    if (!rule.RuleJointSubjectList.Any(r => r.ModelSubjectId == subject.SubjectId))
                     {
-                        conflict = new SlotTimeConflict
-                        {
-                            TimeIndex = slot.Index,
-                            SubjectIds = new List<int> { subject.SubjectId },
-                            ClassIds = new List<int> { kvp.Key.classId }
-                        };
-                        return false;
+                        continue;
                     }
 
-                    var startOffset = subjectOffsets.TryGetValue(subject.SubjectId, out var offset)
-                        ? offset
-                        : 0;
+                    if (!string.IsNullOrWhiteSpace(rule.Date) && !rule.Date.Equals(slot.Date, StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
 
-                    list.Add((subject, startOffset, duration));
+                    if (TryGetStartOffset(rule.StartTime, slot, out var ruleOffset) && ruleOffset >= 0 && ruleOffset <= limit)
+                    {
+                        preferred = ruleOffset;
+                        break;
+                    }
                 }
             }
 
-            var minGap = Math.Max(0, config.MinExamInterval);
-            foreach (var kvp in roomSchedules)
+            return preferred;
+        }
+
+        private static List<OffsetSearchUnit> BuildOffsetSearchUnits(
+            List<SubjectInfo> slotSubjects,
+            TimeSlotInfo slot,
+            Dictionary<int, SubjectOffsetCandidates> candidates,
+            AIExamModel model)
+        {
+            var groups = BuildJointSubjectGroups(slotSubjects, slot, model);
+            var units = new List<OffsetSearchUnit>();
+
+            foreach (var group in groups)
             {
-                var entries = kvp.Value;
-                if (entries.Count <= 1)
+                var unit = new OffsetSearchUnit
+                {
+                    SubjectIds = group.OrderBy(id => id).ToList(),
+                    PrimaryCandidates = BuildUnitCandidates(group, candidates, includeBackward: false),
+                    CombinedCandidates = BuildUnitCandidates(group, candidates, includeBackward: true)
+                };
+
+                units.Add(unit);
+            }
+
+            return units;
+        }
+
+        private static List<List<int>> BuildJointSubjectGroups(
+            List<SubjectInfo> slotSubjects,
+            TimeSlotInfo slot,
+            AIExamModel model)
+        {
+            var parents = new Dictionary<int, int>();
+            foreach (var subject in slotSubjects)
+            {
+                parents[subject.SubjectId] = subject.SubjectId;
+            }
+
+            int Find(int id)
+            {
+                if (parents[id] != id)
+                {
+                    parents[id] = Find(parents[id]);
+                }
+
+                return parents[id];
+            }
+
+            void Union(int a, int b)
+            {
+                var rootA = Find(a);
+                var rootB = Find(b);
+                if (rootA == rootB)
+                {
+                    return;
+                }
+
+                parents[rootB] = rootA;
+            }
+
+            if (model.RuleJointSubjectList != null)
+            {
+                foreach (var rule in model.RuleJointSubjectList)
+                {
+                    if (rule.RuleJointSubjectList == null)
+                    {
+                        continue;
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(rule.Date) && !rule.Date.Equals(slot.Date, StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    var related = rule.RuleJointSubjectList
+                        .Select(item => item.ModelSubjectId)
+                        .Where(parents.ContainsKey)
+                        .Distinct()
+                        .ToList();
+
+                    if (related.Count <= 1)
+                    {
+                        continue;
+                    }
+
+                    var anchor = related[0];
+                    foreach (var subjectId in related.Skip(1))
+                    {
+                        Union(anchor, subjectId);
+                    }
+                }
+            }
+
+            var groups = new Dictionary<int, List<int>>();
+            foreach (var subjectId in parents.Keys)
+            {
+                var root = Find(subjectId);
+                if (!groups.TryGetValue(root, out var list))
+                {
+                    list = new List<int>();
+                    groups[root] = list;
+                }
+
+                list.Add(subjectId);
+            }
+
+            return groups.Values.Select(list => list.OrderBy(id => id).ToList()).ToList();
+        }
+
+        private static List<int> BuildUnitCandidates(
+            List<int> subjectIds,
+            Dictionary<int, SubjectOffsetCandidates> candidates,
+            bool includeBackward)
+        {
+            List<int>? baseList = null;
+            var baseSubjectId = -1;
+
+            foreach (var subjectId in subjectIds)
+            {
+                if (!candidates.TryGetValue(subjectId, out var subjectCandidates))
+                {
+                    return new List<int>();
+                }
+
+                var list = includeBackward ? subjectCandidates.GetCombined() : subjectCandidates.Forward;
+                if (list.Count == 0)
+                {
+                    return new List<int>();
+                }
+
+                if (baseList == null || list.Count < baseList.Count)
+                {
+                    baseList = new List<int>(list);
+                    baseSubjectId = subjectId;
+                }
+            }
+
+            if (baseList == null)
+            {
+                return new List<int>();
+            }
+
+            foreach (var subjectId in subjectIds)
+            {
+                if (subjectId == baseSubjectId)
                 {
                     continue;
                 }
 
-                var ordered = entries
-                    .OrderBy(entry => entry.StartOffset)
-                    .ThenByDescending(entry => entry.Duration)
-                    .ToList();
+                var list = includeBackward ? candidates[subjectId].GetCombined() : candidates[subjectId].Forward;
+                var allowed = new HashSet<int>(list);
+                baseList = baseList.Where(allowed.Contains).ToList();
 
-                for (var i = 1; i < ordered.Count; i++)
+                if (baseList.Count == 0)
                 {
-                    var previous = ordered[i - 1];
-                    var current = ordered[i];
+                    break;
+                }
+            }
 
-                    var previousStart = slot.Start.AddMinutes(previous.StartOffset);
-                    var previousEnd = previousStart.AddMinutes(previous.Duration);
-                    if (previousEnd > slot.End)
+            return baseList;
+        }
+
+        private static Dictionary<int, int>? TryAssignOffsetsForUnits(
+            List<OffsetSearchUnit> units,
+            Dictionary<int, HashSet<int>> subjectRooms,
+            Dictionary<int, int> durations,
+            TimeSlotInfo slot,
+            int minGap,
+            bool useCombinedCandidates)
+        {
+            var orderedUnits = units
+                .Select(unit => new
+                {
+                    Unit = unit,
+                    Candidates = useCombinedCandidates ? unit.CombinedCandidates : unit.PrimaryCandidates
+                })
+                .OrderBy(x => x.Candidates.Count)
+                .ThenBy(x => x.Unit.SubjectIds.Count)
+                .Select(x => x.Unit)
+                .ToList();
+
+            var assignments = new Dictionary<int, int>();
+            var roomSchedules = new Dictionary<int, List<RoomScheduleEntry>>();
+
+            bool Dfs(int index)
+            {
+                if (index >= orderedUnits.Count)
+                {
+                    return true;
+                }
+
+                var unit = orderedUnits[index];
+                var candidates = useCombinedCandidates ? unit.CombinedCandidates : unit.PrimaryCandidates;
+
+                if (candidates.Count == 0)
+                {
+                    return false;
+                }
+
+                foreach (var offset in candidates)
+                {
+                    if (!TryAssignUnit(unit, offset, assignments, roomSchedules, subjectRooms, durations, slot, minGap, out var added))
                     {
-                        previousEnd = slot.End;
+                        continue;
                     }
 
-                    var currentStart = slot.Start.AddMinutes(current.StartOffset);
-                    var currentEnd = currentStart.AddMinutes(current.Duration);
-                    if (currentEnd > slot.End)
+                    if (Dfs(index + 1))
                     {
-                        currentEnd = slot.End;
+                        return true;
                     }
 
-                    if (!HasSufficientGap(previousStart, previousEnd, currentStart, currentEnd, minGap))
+                    UndoAssignment(unit, assignments, roomSchedules, added);
+                }
+
+                return false;
+            }
+
+            return Dfs(0) ? new Dictionary<int, int>(assignments) : null;
+        }
+
+        private static bool TryAssignUnit(
+            OffsetSearchUnit unit,
+            int offset,
+            Dictionary<int, int> assignments,
+            Dictionary<int, List<RoomScheduleEntry>> roomSchedules,
+            Dictionary<int, HashSet<int>> subjectRooms,
+            Dictionary<int, int> durations,
+            TimeSlotInfo slot,
+            int minGap,
+            out List<(int roomId, RoomScheduleEntry entry)> addedEntries)
+        {
+            addedEntries = new List<(int, RoomScheduleEntry)>();
+            var startTime = slot.Start.AddMinutes(offset);
+
+            foreach (var subjectId in unit.SubjectIds)
+            {
+                var duration = durations[subjectId];
+                if (startTime.AddMinutes(duration) > slot.End)
+                {
+                    return false;
+                }
+
+                if (!subjectRooms.TryGetValue(subjectId, out var rooms) || rooms.Count == 0)
+                {
+                    continue;
+                }
+
+                foreach (var roomId in rooms)
+                {
+                    if (!roomSchedules.TryGetValue(roomId, out var schedule))
                     {
-                        conflict = new SlotTimeConflict
+                        continue;
+                    }
+
+                    foreach (var entry in schedule)
+                    {
+                        var existingStart = slot.Start.AddMinutes(entry.Offset);
+                        var existingEnd = existingStart.AddMinutes(entry.Duration);
+                        var candidateStart = startTime;
+                        var candidateEnd = candidateStart.AddMinutes(duration);
+
+                        if (!HasSufficientGap(existingStart, existingEnd, candidateStart, candidateEnd, minGap))
                         {
-                            TimeIndex = slot.Index,
-                            SubjectIds = new List<int>
-                                {
-                                    previous.Subject.SubjectId,
-                                    current.Subject.SubjectId
-                                }
-                                .Distinct()
-                                .ToList(),
-                            ClassIds = CollectClassIdsForSubjects(allocationResult, previous.Subject.SubjectId, current.Subject.SubjectId)
-                        };
-                        return false;
+                            return false;
+                        }
                     }
+                }
+            }
+
+            foreach (var subjectId in unit.SubjectIds)
+            {
+                assignments[subjectId] = offset;
+                if (!subjectRooms.TryGetValue(subjectId, out var rooms) || rooms.Count == 0)
+                {
+                    continue;
+                }
+
+                foreach (var roomId in rooms)
+                {
+                    if (!roomSchedules.TryGetValue(roomId, out var schedule))
+                    {
+                        schedule = new List<RoomScheduleEntry>();
+                        roomSchedules[roomId] = schedule;
+                    }
+
+                    var entry = new RoomScheduleEntry
+                    {
+                        SubjectId = subjectId,
+                        Offset = offset,
+                        Duration = durations[subjectId]
+                    };
+
+                    schedule.Add(entry);
+                    addedEntries.Add((roomId, entry));
                 }
             }
 
             return true;
         }
 
+        private static void UndoAssignment(
+            OffsetSearchUnit unit,
+            Dictionary<int, int> assignments,
+            Dictionary<int, List<RoomScheduleEntry>> roomSchedules,
+            List<(int roomId, RoomScheduleEntry entry)> addedEntries)
+        {
+            foreach (var subjectId in unit.SubjectIds)
+            {
+                assignments.Remove(subjectId);
+            }
+
+            for (var index = addedEntries.Count - 1; index >= 0; index--)
+            {
+                var group = addedEntries[index];
+                if (!roomSchedules.TryGetValue(group.roomId, out var schedule))
+                {
+                    continue;
+                }
+
+                for (var i = schedule.Count - 1; i >= 0; i--)
+                {
+                    if (schedule[i].SubjectId == group.entry.SubjectId && schedule[i].Offset == group.entry.Offset)
+                    {
+                        schedule.RemoveAt(i);
+                        break;
+                    }
+                }
+
+                if (schedule.Count == 0)
+                {
+                    roomSchedules.Remove(group.roomId);
+                }
+            }
+        }
         private static List<int> CollectClassIdsForSubjects(
             SlotRoomAllocationResult allocationResult,
             params int[] subjectIds)
@@ -2598,6 +2816,18 @@ namespace DTcms.Core.Common.Helpers
                 }
             }
 
+            var stepOffsets = ComputeSubjectStartOffsets(slotSubjects, slot, result, config, model);
+            if (stepOffsets == null)
+            {
+                return null;
+            }
+
+            result.SubjectStartOffsets.Clear();
+            foreach (var kv in stepOffsets)
+            {
+                result.SubjectStartOffsets[kv.Key] = kv.Value;
+            }
+
             return result;
         }
 
@@ -3092,6 +3322,79 @@ namespace DTcms.Core.Common.Helpers
             public int Duration { get; set; }
             public int Priority { get; set; }
             public List<ClassInfo> Classes { get; set; } = new();
+        }
+
+        private sealed class SubjectOffsetCandidates
+        {
+            private readonly HashSet<int> _forwardSet = new HashSet<int>();
+            private readonly HashSet<int> _backwardSet = new HashSet<int>();
+            private List<int>? _combined;
+
+            public List<int> Forward { get; } = new List<int>();
+            public List<int> Backward { get; } = new List<int>();
+
+            public void AddForward(int offset)
+            {
+                if (_forwardSet.Add(offset))
+                {
+                    Forward.Add(offset);
+                    _combined = null;
+                }
+            }
+
+            public void AddBackward(int offset)
+            {
+                if (_forwardSet.Contains(offset))
+                {
+                    return;
+                }
+
+                if (_backwardSet.Add(offset))
+                {
+                    Backward.Add(offset);
+                    _combined = null;
+                }
+            }
+
+            public bool ForwardAny()
+            {
+                return Forward.Count > 0;
+            }
+
+            public List<int> GetCombined()
+            {
+                if (_combined != null)
+                {
+                    return _combined;
+                }
+
+                var combined = new List<int>(Forward);
+                var seen = new HashSet<int>(_forwardSet);
+                foreach (var offset in Backward)
+                {
+                    if (seen.Add(offset))
+                    {
+                        combined.Add(offset);
+                    }
+                }
+
+                _combined = combined;
+                return combined;
+            }
+        }
+
+        private sealed class OffsetSearchUnit
+        {
+            public List<int> SubjectIds { get; set; } = new List<int>();
+            public List<int> PrimaryCandidates { get; set; } = new List<int>();
+            public List<int> CombinedCandidates { get; set; } = new List<int>();
+        }
+
+        private sealed class RoomScheduleEntry
+        {
+            public int SubjectId { get; set; }
+            public int Offset { get; set; }
+            public int Duration { get; set; }
         }
 
         private sealed class SubjectTimeAdjustmentState
