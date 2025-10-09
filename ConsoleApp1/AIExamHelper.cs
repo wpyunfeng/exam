@@ -14,7 +14,8 @@ namespace DTcms.Core.Common.Helpers
     /// </summary>
     public static class AIExamHelper
     {
-        private const int MaxRoomCandidatesPerClass = 15;
+        // 0 表示不限制候选考场数量，避免由于过早裁剪导致大班级无法满足同楼层多考场的需求。
+        private const int MaxRoomCandidatesPerClass = 0;
 
         /// <summary>
         /// 自动排考
@@ -807,7 +808,7 @@ namespace DTcms.Core.Common.Helpers
                             return null;
                         }
 
-                        if (candidateIndices.Count > MaxRoomCandidatesPerClass)
+                        if (MaxRoomCandidatesPerClass > 0 && candidateIndices.Count > MaxRoomCandidatesPerClass)
                         {
                             var originalCandidates = candidateIndices.ToList();
                             var preferredSet = new HashSet<int>();
