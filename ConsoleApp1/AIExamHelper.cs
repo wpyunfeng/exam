@@ -1385,6 +1385,16 @@ namespace DTcms.Core.Common.Helpers
 
                         if (roomEvent == null)
                         {
+                            var usageLimit = GetRoomUsageLimit(slot.TimeNo);
+                            if (usageLimit > 0 && roomEvents.Count >= usageLimit)
+                            {
+                                error.AppendLine($"考场 {allocation.Room.Room.ModelRoomName ?? allocation.Room.RoomId.ToString()} 在 {slot.Date} {slot.TimeNo} 的考试次数已达到上限 {usageLimit} 次，无法继续安排科目 {request.Subject.Subject.ModelSubjectName ?? subjectId.ToString()}。");
+                                return null;
+                            }
+                        }
+
+                        if (roomEvent == null)
+                        {
                             foreach (var existingGlobalEvent in container.RoomEvents.Where(e => e.Room.RoomId == allocation.Room.RoomId))
                             {
                                 if (existingGlobalEvent.Slot.Index == slot.Index && existingGlobalEvent.Subject.SubjectId == subjectId)
@@ -3227,6 +3237,26 @@ namespace DTcms.Core.Common.Helpers
         private static bool IsTimeOverlap(DateTime startA, DateTime endA, DateTime startB, DateTime endB)
         {
             return startA < endB && startB < endA;
+        }
+
+        private static int GetRoomUsageLimit(string? timeNo)
+        {
+            if (string.IsNullOrWhiteSpace(timeNo))
+            {
+                return 0;
+            }
+
+            switch (timeNo.Trim())
+            {
+                case "上午场":
+                    return 2;
+                case "下午场":
+                    return 3;
+                case "晚上场":
+                    return 1;
+                default:
+                    return 0;
+            }
         }
 
         #endregion
